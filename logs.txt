@@ -1,61 +1,18 @@
-use the Docker **face-stream**, sau do cd /home/mq/disk2T/quangnv/face to debug, dev and fix. 
-python3 bin/test_multi_branch_video.py 
+docker run -d \
+  --name qv_face \
+  --restart unless-stopped \
+  --privileged \
+  --network host \
+  --gpus all \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e GST_DEBUG="${GST_DEBUG:-2,v4l2*:1}" \
+  -e PYTHONUNBUFFERED=1 \
+  -e DISPLAY="${DISPLAY:-:0}" \
+  -e WS_SERVER="${WS_SERVER:-192.168.6.16}" \
+  -e WS_PORT="${WS_PORT:-8555}" \
+  -v /home/mq/disk2T/quangnv/rtc_events:/app \
+  -t \
+  qv_core
 
-● # Step 1: Add cam1 to recognition + detection
-curl -X POST http://localhost:8083/api/cameras \
-      -H "Content-Type: application/json" \
-      -d '{"camera_id": "cam1", "uri": "rtsp://192.168.6.14:8554/testface", "branches": ["recognition", "detection"]}'
-
-# Step 2: Wait 2s, then add cam2 to recognition + detection
-sleep 2
-curl -X POST http://localhost:8083/api/cameras \
-      -H "Content-Type: application/json" \
-      -d '{"camera_id": "cam2", "uri": "rtsp://192.168.6.14:8554/test", "branches": ["recognition", "detection"]}'
-
-# Step 3: Wait 3s, then remove cam1 from detection branch
-sleep 3
-curl -X DELETE http://localhost:8083/api/cameras/cam2/branches/detection
-curl -X DELETE http://localhost:8083/api/cameras/cam1/branches/recognition
-
-# Add cam1 (đã tồn tại) vào branch mới, ví dụ "recognition"
-curl -X POST http://localhost:8083/api/cameras/cam1/branches/recognition
-
-curl -X POST http://localhost:8083/api/cameras \
-      -H "Content-Type: application/json" \
-      -d '{"camera_id": "cam3", "uri": "rtsp://192.168.6.14:8554/test", "branches": ["recognition", "detection"]}'
-
-Ultrathink
-Kill process cu vaf Test lai voi kich ban tren. Dam bao CRUD camera va branch hoat dong tot, va file output video có dung lượng
-
-thỉnh thoảng free(): unaligned chunk detected in tcache 2
-
-
- hoặc Segmentation fault (core dumped) ở 1 số step nào đó, hoặc thỉnh thoảng chạy rất mượt. Có thể do ở gstream gì đó, hãy ultrathink và check thật kỹ
-Dam bao CRUD camera va branch hoat dong tot, va file output video tot
-Luu y moi lan test thi Kill process cũ và test tầm 10 lần để debug và fix
-
-ngoai ra khong test vs video mà test bang rtsp truoc tranh bị loi queue, do khong dong bo duoc cac branch voi nhau
-
-Hay tu debug va Test cho toi kich ban tren. Dam bao add va Delete dc camera. Toi moi test sang step 1 nhung da bi segmetation fault roi 
-luu y: de debug, dev and fix.  thi docker exec -it face-stream bash, cd                       
-  /home/mq/disk2T/quangnv/face. Sau do moi chay python3      
-  bin/test_multi_branch_video.py 
-
-ffmpeg -i /home/mq/disk2T/quangnv/face/data/output_detection.avi -c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k /home/mq/disk2T/quangnv/face/data/output_detection.mp4
-ffmpeg -i /home/mq/disk2T/quangnv/face/data/output_recognition.avi -c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k /home/mq/disk2T/quangnv/face/data/output_recognition.mp4
-
-Usage:
-
-curl -X POST http://localhost:8083/api/pipeline/kill
-curl -X POST http://localhost:8083/api/pipeline/stop
-
-
-Ultrathink 
-hãy phân tích lại codebase sau đó đề xuất cấu trúc thư mục mới sao cho:
-  - có thể mở rộng bài toán, ví dụ sau này tôi muốn thêm bài toán và logic liên quan đến license plate chẳng hạn.
-  - tách logic và deepstream code 
-  - đi từ 1 config-driven yaml
-  - ghi brainsromming vừa rồi xuống docs/codefolder.md
-
-Tu docs/codefolder.md, cho toi 1 comprehensive plan gồm nhiều phase
-ghi vào folder @plans/folder_refactor
+help me write sh file to full test in /home/mq/disk2T/quangnv/rtc_events/entry/

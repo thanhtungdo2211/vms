@@ -12,6 +12,10 @@ Endpoints:
 - GET    /api/operations/{op_id}                   - Get operation status
 - POST   /api/pipeline/kill                        - Remove all cameras
 - POST   /api/pipeline/stop                        - Stop pipeline
+- POST   /api/branches/{branch}/rtsp/start         - Start RTSP publishing
+- POST   /api/branches/{branch}/rtsp/stop          - Stop RTSP publishing
+- GET    /api/branches/{branch}/rtsp/status        - Get RTSP status for branch
+- GET    /api/rtsp/status                          - Get all RTSP status
 """
 
 import logging
@@ -37,8 +41,10 @@ class CameraAPIServer:
         self,
         cfg,
         manager,
+        rtsp_publisher=None,
     ):
         self.manager = manager
+        self.rtsp_publisher = rtsp_publisher
         self.host = cfg.get("host", "0.0.0.0")
         self.port = cfg.get("port", 8083)
         self.shutdown_event = stop_event
@@ -156,6 +162,53 @@ class CameraAPIServer:
             op_id = str(uuid.uuid4())[:8]
             self.op_queue.put((op_id, self.manager.remove_camera_from_branch, (camera_id, branch_name), {}))
             return {"status": "accepted", "operation_id": op_id}
+
+        # RTSP Publishing Endpoints
+        class RtspStartRequest(BaseModel):
+            location: str
+            bitrate: int = 4000000
+
+        @app.post("/api/branches/{branch_name}/rtsp/start")
+        async def start_rtsp_publish(branch_name: str, request: RtspStartRequest):
+            if not self.rtsp_publisher:
+                raise HTTPException(status_code=503, detail="RTSP publisher not available")
+            if branch_name not in self.manager.branches:
+                raise HTTPException(status_code=404, detail=f"Branch {branch_name} not found")
+            import uuid
+            op_id = str(uuid.uuid4())[:8]
+            self.op_queue.put((
+                op_id,
+                self.rtsp_publisher.start_publish,
+                (branch_name, request.location, request.bitrate),
+                {}
+            ))
+            return {"status": "accepted", "operation_id": op_id}
+
+        @app.post("/api/branches/{branch_name}/rtsp/stop")
+        async def stop_rtsp_publish(branch_name: str):
+            if not self.rtsp_publisher:
+                raise HTTPException(status_code=503, detail="RTSP publisher not available")
+            import uuid
+            op_id = str(uuid.uuid4())[:8]
+            self.op_queue.put((
+                op_id,
+                self.rtsp_publisher.stop_publish,
+                (branch_name,),
+                {}
+            ))
+            return {"status": "accepted", "operation_id": op_id}
+
+        @app.get("/api/branches/{branch_name}/rtsp/status")
+        async def get_branch_rtsp_status(branch_name: str):
+            if not self.rtsp_publisher:
+                return {"publishing": False, "error": "RTSP publisher not available"}
+            return self.rtsp_publisher.get_status(branch_name)
+
+        @app.get("/api/rtsp/status")
+        async def get_all_rtsp_status():
+            if not self.rtsp_publisher:
+                return {"error": "RTSP publisher not available"}
+            return self.rtsp_publisher.get_status()
 
         return app
 

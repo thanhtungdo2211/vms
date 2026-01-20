@@ -70,5 +70,5 @@ COPY scripts/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
 # Build custom gst-nvinfer plugin
-COPY gst-nvinfer /tmp/gst-nvinfer
+COPY data/gst-plugins/gst-nvinfer /tmp/gst-nvinfer
 RUN cd /tmp/gst-nvinfer && make && make install && rm -rf /tmp/gst-nvinfer

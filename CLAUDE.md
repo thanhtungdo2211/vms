@@ -4,8 +4,8 @@
 
 | Item | Value |
 |------|-------|
-| Container | `face-stream` |
-| Host Path | `/home/mq/disk2T/quangnv/face` |
+| Container | `qv_face` |
+| Host Path | `/home/mq/disk2T/quangnv/rtc_events` |
 | Container Path | `/app` |
 | API Port | `8083` |
 | Python | `3.10.12` |
@@ -16,17 +16,17 @@
 ### Enter Container (Interactive Shell)
 
 ```bash
-docker exec -it -w /app face-stream bash
+docker exec -it -w /app qv_face bash
 ```
 
 ### Run Commands Inside Container
 
 ```bash
 # Single command
-docker exec -w /app face-stream <command>
+docker exec -w /app qv_face <command>
 
 # With bash
-docker exec -w /app face-stream bash -c "<commands>"
+docker exec -w /app qv_face bash -c "<commands>"
 ```
 
 ## Debug & Test
@@ -41,17 +41,17 @@ python3 entry/test_multi_branch_video.py
 python3 entry/test_multi_branch_video.py --config configs/test-single-branch.yaml
 
 # From host
-docker exec -w /app face-stream python3 entry/test_multi_branch_video.py
+docker exec -w /app qv_face python3 entry/test_multi_branch_video.py
 ```
 
 ### Background Run (with logs)
 
 ```bash
 # Start in background
-docker exec -d -w /app face-stream bash -c "python3 entry/test_multi_branch_video.py > /tmp/pipeline.log 2>&1"
+docker exec -d -w /app qv_face bash -c "python3 entry/test_multi_branch_video.py > /tmp/pipeline.log 2>&1"
 
 # View logs
-docker exec face-stream tail -f /tmp/pipeline.log
+docker exec qv_face tail -f /tmp/pipeline.log
 ```
 
 ### Full Test Script
@@ -115,30 +115,30 @@ curl http://localhost:8083/api/cameras | python3 -m json.tool
 ### Check Container Status
 
 ```bash
-docker ps -a --filter "name=face-stream"
+docker ps -a --filter "name=qv_face"
 ```
 
 ### View Logs
 
 ```bash
 # Container logs
-docker logs face-stream --tail 100
+docker logs qv_face --tail 100
 
 # Pipeline logs
-docker exec face-stream tail -f /tmp/pipeline.log
-docker exec face-stream tail -f /tmp/full_test.log
+docker exec qv_face tail -f /tmp/pipeline.log
+docker exec qv_face tail -f /tmp/full_test.log
 ```
 
 ### Kill Pipeline Processes
 
 ```bash
-docker exec face-stream pkill -9 -f 'python.*test_multi'
+docker exec qv_face pkill -9 -f 'python.*test_multi'
 ```
 
 ### Check Running Processes
 
 ```bash
-docker exec face-stream ps aux | grep python
+docker exec qv_face ps aux | grep python
 ```
 
 ### Container Restart
@@ -151,7 +151,7 @@ cd scripts && docker compose restart
 
 ## Common Issues
 
-1. **Container unhealthy**: Check `docker logs face-stream` for errors
+1. **Container unhealthy**: Check `docker logs qv_face` for errors
 2. **Port 8083 in use**: Run `lsof -i :8083` and kill the process
 3. **Pipeline crash**: Check `/tmp/pipeline.log` inside container
 4. **RTSP timeout**: Verify camera URI is reachable from container

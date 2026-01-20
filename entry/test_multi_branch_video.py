@@ -30,6 +30,7 @@ from gi.repository import Gst
 # Import directly from modules (no __init__.py)
 from src.pipeline_builder import PipelineBuilder
 from src.camera_manager import MultibranchCameraManager
+from src.rtsp_publisher_manager import RtspPublisherManager
 from src.common import load_config
 from api.camera_api import CameraAPIServer
 from api.shutdown import setup_signal_handlers, wait_for_shutdown
@@ -62,6 +63,9 @@ def main():
     # Create camera manager for dynamic camera control
     manager = MultibranchCameraManager(pipeline, builder.branches)
 
+    # Create RTSP publisher for on-demand streaming
+    rtsp_publisher = RtspPublisherManager(pipeline, builder.branches)
+
     # Setup signal handlers for graceful shutdown
     setup_signal_handlers()
 
@@ -89,8 +93,8 @@ def main():
     # Start processors after pipeline is ready
     builder.start_processors()
 
-    # Start camera API server
-    api = CameraAPIServer(config.get("camera_api", {}), manager)
+    # Start camera API server with RTSP publisher
+    api = CameraAPIServer(config.get("camera_api", {}), manager, rtsp_publisher)
     api.start()
 
     # Wait for shutdown signal
