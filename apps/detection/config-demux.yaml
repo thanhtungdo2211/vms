@@ -27,3 +27,4 @@ elements:
     config_file: "data/face/models/scrfd640/infer.txt"
   - type: nvstreamdemux
     name: demux
+    # probes: {sink: detection_fps_probe}  # Disabled to test stability

@@ -154,7 +154,8 @@ class DemuxRtspPublisher:
         camera_id: str,
         branch_name: str,
         location: str,
-        bitrate: int = 4000000
+        bitrate: int = 4000000,
+        max_retries: int = 3
     ) -> bool:
         """Start RTSP publishing for specific camera with annotations.
 
@@ -163,6 +164,7 @@ class DemuxRtspPublisher:
             branch_name: Branch with nvstreamdemux
             location: RTSP server URL
             bitrate: H264 encoding bitrate
+            max_retries: Number of retry attempts on failure
 
         Returns:
             True if started successfully
@@ -171,12 +173,45 @@ class DemuxRtspPublisher:
             logger.error(f"[DemuxRTSP] Invalid RTSP URL: {location}")
             return False
 
+        # Retry loop for stability
+        for attempt in range(max_retries):
+            result = self._try_start_publish(camera_id, branch_name, location, bitrate)
+            if result:
+                return True
+
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 1.0  # Exponential backoff: 1s, 2s, 3s
+                logger.warning(f"[DemuxRTSP] Retry {attempt + 1}/{max_retries} for {camera_id}/{branch_name} in {wait_time}s")
+                time.sleep(wait_time)
+
+        logger.error(f"[DemuxRTSP] Failed to start {camera_id}/{branch_name} after {max_retries} attempts")
+        return False
+
+    def _try_start_publish(
+        self,
+        camera_id: str,
+        branch_name: str,
+        location: str,
+        bitrate: int
+    ) -> bool:
+        """Internal method to attempt starting RTSP publish."""
+
         with self._lock:
             key = (camera_id, branch_name)
 
             if key in self._publishers:
                 logger.warning(f"[DemuxRTSP] {camera_id}/{branch_name} already publishing")
-                return False
+                return True  # Already publishing is success
+
+            # Check pipeline is in PLAYING state before starting RTSP
+            _, state, _ = self.pipeline.get_state(0)
+            if state != Gst.State.PLAYING:
+                logger.warning(f"[DemuxRTSP] Pipeline not PLAYING (state={state.value_nick}), waiting...")
+                time.sleep(1.0)
+                _, state, _ = self.pipeline.get_state(0)
+                if state != Gst.State.PLAYING:
+                    logger.error(f"[DemuxRTSP] Pipeline still not PLAYING after wait")
+                    return False
 
             # Check camera exists and get source_id
             cam = self.camera_manager.get_camera(camera_id)
@@ -440,6 +475,7 @@ class DemuxRtspPublisher:
         if osd:
             osd.set_property("process-mode", 0)  # CPU mode
             osd.set_property("display-text", 1)
+            osd.set_property("display-clock", 1)  # Show clock
             elements.append(osd)
         else:
             logger.warning(f"[DemuxRTSP] nvdsosd not available, skipping OSD")

@@ -40,3 +40,4 @@ elements:
     probes: {src: sgie_probe}
   - type: nvstreamdemux
     name: demux
+    # probes: {sink: recognition_fps_probe}  # Disabled to test stability

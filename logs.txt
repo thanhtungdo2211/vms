@@ -39,6 +39,18 @@ curl -s -X POST "http://localhost:8084/api/cameras" \
   -H "Content-Type: application/json" \
   -d '{"camera_id": "cam3", "uri": "rtsp://192.168.6.14:8554/testface3", "branches": ["recognition", "detection"]}'
 
+# Add cam4
+curl -s -X POST "http://localhost:8084/api/cameras" \
+  -H "Content-Type: application/json" \
+  -d '{"camera_id": "cam4", "uri": "rtsp://192.168.6.14:8554/testface4", "branches": ["recognition", "detection"]}'
+
+
+# Add cam5
+curl -s -X POST "http://localhost:8084/api/cameras" \
+  -H "Content-Type: application/json" \
+  -d '{"camera_id": "cam5", "uri": "rtsp://192.168.6.14:8554/testface4", "branches": ["detection"]}'
+
+
 2. List Cameras
 
 curl -s "http://localhost:8084/api/cameras" | python3 -m json.tool
@@ -73,3 +85,8 @@ curl -s -X POST "http://localhost:8084/api/cameras/cam2/branches/recognition/rts
 
 ffplay rtsp://192.168.6.14:8554/cam1_detection
 ffplay rtsp://192.168.6.14:8554/cam2_recognition
+
+
+
+cảm giác chạy không được ổn định với kịch bản dưới đây: [Pasted text #3 +63 lines] Thỉnh thoảng khi Start Per-Camera RTSP
+  Publishing o 1 camera nao do lai bi lỗi. Hãy giúp tôi debug và fix chuyên sâu

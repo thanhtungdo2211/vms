@@ -13,8 +13,12 @@ Usage:
 """
 
 import argparse
+import faulthandler
 import logging
 import sys
+
+# Enable faulthandler to print Python traceback on segfault
+faulthandler.enable()
 
 # Configure logging early
 logging.basicConfig(
