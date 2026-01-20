@@ -79,19 +79,18 @@ class DemuxRtspPublisher:
         self._setup_demux_handlers()
 
     def _setup_demux_handlers(self):
-        """Register pad-added handlers and pre-request pads on all demux elements.
+        """Pre-request pads on all demux elements.
 
         nvstreamdemux requires pads to be requested while pipeline is in NULL state.
         Pre-requesting pads for max_cameras ensures they're available for dynamic cameras.
+
+        NOTE: We do NOT register pad-added handler because it causes memory corruption
+        when fired during request_pad_simple. Instead, we get pads directly.
         """
         for branch_name, branch_info in self.branches.items():
             demux = self._get_demux(branch_name)
             if not demux:
                 continue
-
-            # Register pad-added handler
-            demux.connect("pad-added", self._on_demux_pad_added, branch_name)
-            logger.info(f"[DemuxRTSP] Registered pad-added handler for {branch_name}")
 
             # Pre-request pads for all possible cameras (based on max_cameras/batch_size)
             # This MUST be done while pipeline is in NULL state
@@ -228,36 +227,37 @@ class DemuxRtspPublisher:
                 # Get demux src pad
                 pad_name = f"src_{source_id}"
 
-                # First try to get existing pad (might already be created dynamically)
-                demux_src = demux.get_static_pad(pad_name)
+                # First try to get existing pad by iterating src pads
+                demux_src = None
+                it = demux.iterate_src_pads()
+                while True:
+                    result, pad = it.next()
+                    if result == Gst.IteratorResult.DONE:
+                        break
+                    if result == Gst.IteratorResult.OK and pad.get_name() == pad_name:
+                        demux_src = pad
+                        logger.info(f"[DemuxRTSP] Found existing pad {pad_name}")
+                        break
 
-                # Also check if pad exists as a dynamic pad by iterating
+                # If pad not found, request it (may have been released previously)
                 if not demux_src:
-                    it = demux.iterate_src_pads()
-                    while True:
-                        result, pad = it.next()
-                        if result == Gst.IteratorResult.DONE:
-                            break
-                        if result == Gst.IteratorResult.OK and pad.get_name() == pad_name:
-                            demux_src = pad
-                            logger.info(f"[DemuxRTSP] Found existing dynamic pad {pad_name}")
-                            break
+                    demux_src = demux.request_pad_simple(pad_name)
+                    if demux_src:
+                        logger.info(f"[DemuxRTSP] Requested pad {pad_name}")
+                    else:
+                        logger.warning(f"[DemuxRTSP] Failed to request pad {pad_name}")
 
-                # Link queue sink to demux src if we have the pad
+                # Link queue sink to demux src
                 queue = elements[0]
                 queue_sink = queue.get_static_pad("sink")
 
                 if demux_src:
                     # Pad exists - link directly
                     if demux_src.link(queue_sink) != Gst.PadLinkReturn.OK:
-                        raise RuntimeError(f"Failed to link demux to queue")
-                    logger.info(f"[DemuxRTSP] Linked existing pad {pad_name} to RTSP chain")
+                        raise RuntimeError(f"Failed to link demux pad {pad_name} to queue")
+                    logger.info(f"[DemuxRTSP] Linked {pad_name} to RTSP chain")
                 else:
-                    # Pad doesn't exist yet - store pending link request
-                    # The global pad-added handler will link when pad appears
-                    pending_key = (branch_name, pad_name)
-                    self._pending_links[pending_key] = (queue_sink, key, elements)
-                    logger.info(f"[DemuxRTSP] Waiting for pad {pad_name} (pending link registered)")
+                    raise RuntimeError(f"Could not get or request pad {pad_name}")
 
                 # Sync element states
                 for elem in elements:
@@ -297,6 +297,10 @@ class DemuxRtspPublisher:
     def stop_publish(self, camera_id: str, branch_name: str) -> bool:
         """Stop RTSP publishing for specific camera.
 
+        Uses blocking probe pattern (like camera_manager.py) to safely stop
+        data flow before unlinking. This prevents race conditions that could
+        affect other cameras sharing the same nvstreamdemux.
+
         Args:
             camera_id: Camera to stop streaming
             branch_name: Branch identifier
@@ -312,44 +316,50 @@ class DemuxRtspPublisher:
                 logger.warning(f"[DemuxRTSP] {camera_id}/{branch_name} not publishing")
                 return False
 
-            demux = self._get_demux(branch_name)
-
             try:
-                # Get pipeline state
-                _, prev_state, _ = self.pipeline.get_state(0)
+                demux_pad = pub.demux_pad
+                elements = pub.elements
+                probe_id = None
 
-                # Pause pipeline
-                if prev_state == Gst.State.PLAYING:
-                    logger.info(f"[DemuxRTSP] Pausing pipeline for RTSP teardown")
-                    self.pipeline.set_state(Gst.State.PAUSED)
-                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
-                    time.sleep(0.3)
+                # Step 1: Block data flow on demux pad BEFORE unlinking
+                # This is critical - prevents race conditions with other cameras
+                if demux_pad and elements:
+                    blocked = threading.Event()
 
-                # Unlink demux from queue
-                if pub.demux_pad and pub.elements:
-                    queue = pub.elements[0]
+                    def block_probe(pad, info):
+                        blocked.set()
+                        return Gst.PadProbeReturn.OK  # Keep blocking
+
+                    logger.debug(f"[DemuxRTSP] Adding block probe for {camera_id}/{branch_name}")
+                    probe_id = demux_pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, block_probe)
+
+                    # Wait for probe to trigger (data flow blocked)
+                    if not blocked.wait(timeout=2.0):
+                        logger.warning(f"[DemuxRTSP] Block probe timeout for {camera_id}/{branch_name}")
+                    else:
+                        logger.debug(f"[DemuxRTSP] Data flow blocked for {camera_id}/{branch_name}")
+
+                # Step 2: Unlink demux from queue (safe now that data is blocked)
+                if demux_pad and elements:
+                    queue = elements[0]
                     queue_sink = queue.get_static_pad("sink")
                     if queue_sink and queue_sink.is_linked():
-                        pub.demux_pad.unlink(queue_sink)
+                        demux_pad.unlink(queue_sink)
+                        logger.info(f"[DemuxRTSP] Unlinked demux pad for {camera_id}/{branch_name}")
 
-                # Release demux pad (if it was a request pad)
-                # Note: nvstreamdemux pads are sometimes-pads, check if releasable
-                if pub.demux_pad and demux:
-                    try:
-                        demux.release_request_pad(pub.demux_pad)
-                    except:
-                        pass  # May be static pad
+                # Step 3: Remove blocking probe (allow demux to continue for other cameras)
+                if demux_pad and probe_id is not None:
+                    demux_pad.remove_probe(probe_id)
+                    logger.debug(f"[DemuxRTSP] Removed block probe for {camera_id}/{branch_name}")
 
-                # Set elements to NULL and remove
-                for elem in reversed(pub.elements):
+                # Small delay to let any in-flight data in the chain clear
+                time.sleep(0.1)
+
+                # Step 4: Set elements to NULL and remove from pipeline
+                for elem in reversed(elements):
                     elem.set_state(Gst.State.NULL)
-                    elem.get_state(Gst.CLOCK_TIME_NONE)
+                    elem.get_state(STATE_CHANGE_TIMEOUT)
                     self.pipeline.remove(elem)
-
-                # Resume pipeline
-                if prev_state == Gst.State.PLAYING:
-                    self.pipeline.set_state(Gst.State.PLAYING)
-                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
 
                 del self._publishers[key]
                 logger.info(f"[DemuxRTSP] Stopped {camera_id}/{branch_name}")
@@ -357,8 +367,12 @@ class DemuxRtspPublisher:
 
             except Exception as e:
                 logger.error(f"[DemuxRTSP] Failed to stop publish: {e}", exc_info=True)
-                if prev_state == Gst.State.PLAYING:
-                    self.pipeline.set_state(Gst.State.PLAYING)
+                # Cleanup probe if still attached
+                if probe_id is not None and pub.demux_pad:
+                    try:
+                        pub.demux_pad.remove_probe(probe_id)
+                    except:
+                        pass
                 return False
 
     def get_status(
@@ -439,12 +453,9 @@ class DemuxRtspPublisher:
             conv.set_property("nvbuf-memory-type", 3)
         elements.append(conv)
 
-        # Caps filter
+        # Caps filter - x264enc needs system memory (not NVMM)
         caps = Gst.ElementFactory.make("capsfilter", f"{prefix}_caps")
-        if conv.get_factory().get_name() == "nvvideoconvert":
-            caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=NV12"))
-        else:
-            caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
+        caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
         elements.append(caps)
 
         # H264 encoder
