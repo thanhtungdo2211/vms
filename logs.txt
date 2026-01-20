@@ -60,17 +60,22 @@ curl -s "http://localhost:8084/api/cameras" | python3 -m json.tool
 # cam1/detection -> rtsp://192.168.6.14:8554/cam1_detection
 curl -s -X POST "http://localhost:8084/api/cameras/cam1/branches/detection/rtsp/start" \
   -H "Content-Type: application/json" \
-  -d '{"location": "rtsp://192.168.6.14:8554/cam1_detection", "bitrate": 4000000}'
+  -d '{"location": "rtsp://192.168.6.14:8554/cam1_detection", "bitrate": 1000000}'
+
+
+curl -s -X POST "http://localhost:8084/api/cameras/cam1/branches/recognition/rtsp/start" \
+  -H "Content-Type: application/json" \
+  -d '{"location": "rtsp://192.168.6.14:8554/cam1_recognition", "bitrate": 1000000}'
 
 # cam2/recognition -> rtsp://192.168.6.14:8554/cam2_recognition
 curl -s -X POST "http://localhost:8084/api/cameras/cam2/branches/recognition/rtsp/start" \
   -H "Content-Type: application/json" \
-  -d '{"location": "rtsp://192.168.6.14:8554/cam2_recognition", "bitrate": 4000000}'
+  -d '{"location": "rtsp://192.168.6.14:8554/cam2_recognition", "bitrate": 1000000}'
 
 # cam3/recognition -> rtsp://192.168.6.14:8554/cam3_recognition
 curl -s -X POST "http://localhost:8084/api/cameras/cam3/branches/recognition/rtsp/start" \
   -H "Content-Type: application/json" \
-  -d '{"location": "rtsp://192.168.6.14:8554/cam3_recognition", "bitrate": 4000000}'
+  -d '{"location": "rtsp://192.168.6.14:8554/cam3_recognition", "bitrate": 1000000}'
 
 4. Check Per-Camera RTSP Status
 

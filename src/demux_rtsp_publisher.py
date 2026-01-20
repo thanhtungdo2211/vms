@@ -298,6 +298,9 @@ class DemuxRtspPublisher:
                 for elem in elements:
                     elem.sync_state_with_parent()
 
+                # Brief delay to allow elements to fully initialize
+                time.sleep(0.2)
+
                 # Store publish info
                 self._publishers[key] = DemuxPublishInfo(
                     camera_id=camera_id,
@@ -464,18 +467,18 @@ class DemuxRtspPublisher:
         """Create RTSP sink element chain with OSD for per-camera streaming."""
         elements = []
 
-        # Queue for buffering
+        # Queue for buffering - larger buffer to handle timing variations
         queue = Gst.ElementFactory.make("queue", f"{prefix}_q")
-        queue.set_property("max-size-buffers", 30)
-        queue.set_property("leaky", 2)
+        queue.set_property("max-size-buffers", 60)  # Increased from 30
+        queue.set_property("max-size-time", 2 * Gst.SECOND)  # 2 second buffer
+        queue.set_property("leaky", 2)  # Drop old buffers
         elements.append(queue)
 
         # OSD - draw annotations on this camera's frames
         osd = Gst.ElementFactory.make("nvdsosd", f"{prefix}_osd")
         if osd:
-            osd.set_property("process-mode", 0)  # CPU mode
+            osd.set_property("process-mode", 1)  # CPU mode
             osd.set_property("display-text", 1)
-            osd.set_property("display-clock", 1)  # Show clock
             elements.append(osd)
         else:
             logger.warning(f"[DemuxRTSP] nvdsosd not available, skipping OSD")
@@ -510,6 +513,7 @@ class DemuxRtspPublisher:
         enc.set_property("bitrate", bitrate // 1000)
         enc.set_property("speed-preset", "ultrafast")
         enc.set_property("tune", "zerolatency")
+        enc.set_property("threads", 4)  # Use 4 threads for encoding
         elements.append(enc)
 
         # H264 parser
@@ -517,12 +521,13 @@ class DemuxRtspPublisher:
         parse.set_property("config-interval", -1)
         elements.append(parse)
 
-        # RTSP client sink
+        # RTSP client sink with stability settings
         sink = Gst.ElementFactory.make("rtspclientsink", f"{prefix}_sink")
         sink.set_property("location", location)
-        sink.set_property("protocols", 4)  # TCP
-        sink.set_property("latency", 100)
+        sink.set_property("protocols", 4)  # TCP - more reliable than UDP
+        sink.set_property("latency", 200)  # 200ms latency for stability
         sink.set_property("do-rtsp-keep-alive", True)
+        sink.set_property("timeout", 5000000)  # 5 second timeout (microseconds)
         elements.append(sink)
 
         return elements

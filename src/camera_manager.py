@@ -177,7 +177,13 @@ class MultibranchCameraManager:
                     source.set_property("disable-audio", True)
                     source.set_property("source-id", source_id)
                     source.set_property("cudadec-memtype", 0)  # Device memory
-                    source.set_property("num-extra-surfaces", 1)
+                    source.set_property("num-extra-surfaces", 2)  # Extra buffers for stability
+
+                    # STABILITY: Jitter buffer settings to prevent "decreasing timestamp" warnings
+                    # These help handle network jitter and out-of-order frames from RTSP streams
+                    source.set_property("latency", 500)  # 500ms jitter buffer
+                    source.set_property("drop-frame-interval", 0)  # Keep all frames
+
                     bin_elem.add(source)
 
                     # Connect pad-added for nvurisrcbin -> tee (video pads: vsrc_*)
