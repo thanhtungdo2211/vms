@@ -16,3 +16,72 @@ docker run -d \
   qv_core
 
 help me write sh file to full test in /home/mq/disk2T/quangnv/rtc_events/entry/
+
+
+
+Viet full test vao /home/mq/disk2T/quangnv/rtc_events/entry/publish_mtx.sh
+    - chay san detection va branch face recognition
+    - add cam1 rtsp://192.168.6.14:8554/testface1 vao 2 nhanh detection va branch face recognition
+    - add cam2 rtsp://192.168.6.14:8554/testface2 vao 2 nhanh detection va branch face recognition
+    - pushlish mediaMTX cho cam1 của nhanh detection
+    - pushlish mediaMTX cho cam2 của nhanh face recognition
+osd rieng cho moi camera, thay vi phai osd het nhu hien tai
+
+Bat buoc phải dung code demux để tận dụng kết quả infer hiện tại. 
+The demux is AFTER inference but BEFORE OSD, so each camera can get its own OSD in the RTSP chain,
+Hay debug and test lai cho toi
+
+##1. Check API Health
+curl -s http://localhost:8084/api/health
+
+2. Add Cameras
+
+# Add cam1
+curl -s -X POST "http://localhost:8084/api/cameras" \
+  -H "Content-Type: application/json" \
+  -d '{"camera_id": "cam1", "uri": "rtsp://192.168.6.14:8554/testface1", "branches": ["recognition", "detection"]}'
+
+# Add cam2
+curl -s -X POST "http://localhost:8084/api/cameras" \
+  -H "Content-Type: application/json" \
+  -d '{"camera_id": "cam2", "uri": "rtsp://192.168.6.14:8554/testface2", "branches": ["recognition", "detection"]}'
+
+# Add cam3
+curl -s -X POST "http://localhost:8084/api/cameras" \
+  -H "Content-Type: application/json" \
+  -d '{"camera_id": "cam3", "uri": "rtsp://192.168.6.14:8554/testface3", "branches": ["recognition", "detection"]}'
+
+3. List Cameras
+
+curl -s "http://localhost:8084/api/cameras" | python3 -m json.tool
+
+4. Start Per-Camera RTSP Publishing
+
+# cam1/detection -> rtsp://192.168.6.14:8554/cam1_detection
+curl -s -X POST "http://localhost:8084/api/cameras/cam1/branches/detection/rtsp/start" \
+  -H "Content-Type: application/json" \
+  -d '{"location": "rtsp://192.168.6.14:8554/cam1_detection", "bitrate": 4000000}'
+
+# cam2/recognition -> rtsp://192.168.6.14:8554/cam2_recognition
+curl -s -X POST "http://localhost:8084/api/cameras/cam2/branches/recognition/rtsp/start" \
+  -H "Content-Type: application/json" \
+  -d '{"location": "rtsp://192.168.6.14:8554/cam2_recognition", "bitrate": 4000000}'
+
+# cam3/recognition -> rtsp://192.168.6.14:8554/cam3_recognition
+curl -s -X POST "http://localhost:8084/api/cameras/cam3/branches/recognition/rtsp/start" \
+  -H "Content-Type: application/json" \
+  -d '{"location": "rtsp://192.168.6.14:8554/cam3_recognition", "bitrate": 4000000}'
+
+5. Check Per-Camera RTSP Status
+
+curl -s "http://localhost:8084/api/cameras/rtsp/status" | python3 -m json.tool
+
+6. Stop Per-Camera RTSP
+
+curl -s -X POST "http://localhost:8084/api/cameras/cam1/branches/detection/rtsp/stop"
+curl -s -X POST "http://localhost:8084/api/cameras/cam2/branches/recognition/rtsp/stop"
+
+7. View Streams (ffplay)
+
+ffplay rtsp://192.168.6.14:8554/cam1_detection
+ffplay rtsp://192.168.6.14:8554/cam2_recognition

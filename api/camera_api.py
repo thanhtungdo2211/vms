@@ -12,10 +12,14 @@ Endpoints:
 - GET    /api/operations/{op_id}                   - Get operation status
 - POST   /api/pipeline/kill                        - Remove all cameras
 - POST   /api/pipeline/stop                        - Stop pipeline
-- POST   /api/branches/{branch}/rtsp/start         - Start RTSP publishing
-- POST   /api/branches/{branch}/rtsp/stop          - Stop RTSP publishing
+- POST   /api/branches/{branch}/rtsp/start         - Start RTSP publishing (full branch)
+- POST   /api/branches/{branch}/rtsp/stop          - Stop RTSP publishing (full branch)
 - GET    /api/branches/{branch}/rtsp/status        - Get RTSP status for branch
 - GET    /api/rtsp/status                          - Get all RTSP status
+- POST   /api/cameras/{id}/branches/{branch}/rtsp/start  - Start per-camera RTSP
+- POST   /api/cameras/{id}/branches/{branch}/rtsp/stop   - Stop per-camera RTSP
+- GET    /api/cameras/{id}/branches/{branch}/rtsp/status - Get per-camera RTSP status
+- GET    /api/cameras/rtsp/status                  - Get all per-camera RTSP status
 """
 
 import logging
@@ -42,9 +46,11 @@ class CameraAPIServer:
         cfg,
         manager,
         rtsp_publisher=None,
+        demux_rtsp_publisher=None,
     ):
         self.manager = manager
         self.rtsp_publisher = rtsp_publisher
+        self.demux_rtsp_publisher = demux_rtsp_publisher
         self.host = cfg.get("host", "0.0.0.0")
         self.port = cfg.get("port", 8083)
         self.shutdown_event = stop_event
@@ -209,6 +215,51 @@ class CameraAPIServer:
             if not self.rtsp_publisher:
                 return {"error": "RTSP publisher not available"}
             return self.rtsp_publisher.get_status()
+
+        # Per-Camera RTSP Publishing Endpoints
+        @app.post("/api/cameras/{camera_id}/branches/{branch_name}/rtsp/start")
+        async def start_per_camera_rtsp(camera_id: str, branch_name: str, request: RtspStartRequest):
+            if not self.demux_rtsp_publisher:
+                raise HTTPException(status_code=503, detail="Per-camera RTSP publisher not available")
+            if not self.manager.has_camera(camera_id):
+                raise HTTPException(status_code=404, detail=f"Camera {camera_id} not found")
+            if branch_name not in self.manager.branches:
+                raise HTTPException(status_code=404, detail=f"Branch {branch_name} not found")
+            import uuid
+            op_id = str(uuid.uuid4())[:8]
+            self.op_queue.put((
+                op_id,
+                self.demux_rtsp_publisher.start_publish,
+                (camera_id, branch_name, request.location, request.bitrate),
+                {}
+            ))
+            return {"status": "accepted", "operation_id": op_id}
+
+        @app.post("/api/cameras/{camera_id}/branches/{branch_name}/rtsp/stop")
+        async def stop_per_camera_rtsp(camera_id: str, branch_name: str):
+            if not self.demux_rtsp_publisher:
+                raise HTTPException(status_code=503, detail="Per-camera RTSP publisher not available")
+            import uuid
+            op_id = str(uuid.uuid4())[:8]
+            self.op_queue.put((
+                op_id,
+                self.demux_rtsp_publisher.stop_publish,
+                (camera_id, branch_name),
+                {}
+            ))
+            return {"status": "accepted", "operation_id": op_id}
+
+        @app.get("/api/cameras/{camera_id}/branches/{branch_name}/rtsp/status")
+        async def get_per_camera_rtsp_status(camera_id: str, branch_name: str):
+            if not self.demux_rtsp_publisher:
+                return {"publishing": False, "error": "Per-camera RTSP publisher not available"}
+            return self.demux_rtsp_publisher.get_status(camera_id, branch_name)
+
+        @app.get("/api/cameras/rtsp/status")
+        async def get_all_per_camera_rtsp_status():
+            if not self.demux_rtsp_publisher:
+                return {"error": "Per-camera RTSP publisher not available"}
+            return self.demux_rtsp_publisher.get_status()
 
         return app
 

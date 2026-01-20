@@ -143,22 +143,40 @@ class PipelineBuilder:
 
         # Create element chain
         chain = [mux]
+        demux_elem = None
         for elem_cfg in cfg.get("elements", []):
             elem = self._create_element(elem_cfg, name)
             chain.append(elem)
             for pad, probe in elem_cfg.get("probes", {}).items():
                 self.probe_registry.attach(elem, pad, probe)
+            # Track demux element (doesn't link to next in chain normally)
+            if elem_cfg["type"] == "nvstreamdemux":
+                demux_elem = elem
 
         # Create sink
         sink = self.branch_sinks[name].create(self.pipeline)
-        chain.append(sink)
 
-        # Link chain
-        for i in range(len(chain) - 1):
-            if not chain[i].link(chain[i + 1]):
-                raise RuntimeError(f"Failed to link {chain[i].get_name()} -> {chain[i + 1].get_name()}")
+        # Link chain - special handling for demux
+        if demux_elem:
+            # Link everything up to demux, demux is terminal (pads are dynamic)
+            for i in range(len(chain) - 1):
+                if chain[i + 1] == demux_elem:
+                    # Link to demux sink pad
+                    if not chain[i].link(demux_elem):
+                        raise RuntimeError(f"Failed to link {chain[i].get_name()} -> demux")
+                    break
+                if not chain[i].link(chain[i + 1]):
+                    raise RuntimeError(f"Failed to link {chain[i].get_name()} -> {chain[i + 1].get_name()}")
+            # Demux doesn't link to sink - per-camera RTSP chains attach to demux src pads
+            logger.info(f"[{name}] Branch with nvstreamdemux - per-camera RTSP via demux pads")
+        else:
+            # Normal chain with sink
+            chain.append(sink)
+            for i in range(len(chain) - 1):
+                if not chain[i].link(chain[i + 1]):
+                    raise RuntimeError(f"Failed to link {chain[i].get_name()} -> {chain[i + 1].get_name()}")
 
-        self.branches[name] = BranchInfo(name, mux, chain[1:-1], sink, cfg.get("max_cameras", 8))
+        self.branches[name] = BranchInfo(name, mux, chain[1:-1] if not demux_elem else chain[1:], sink, cfg.get("max_cameras", 8))
 
     def _create_element(self, cfg: dict, prefix: str) -> Gst.Element:
         """Create GStreamer element from config."""

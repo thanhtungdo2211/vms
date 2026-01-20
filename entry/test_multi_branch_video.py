@@ -31,6 +31,7 @@ from gi.repository import Gst
 from src.pipeline_builder import PipelineBuilder
 from src.camera_manager import MultibranchCameraManager
 from src.rtsp_publisher_manager import RtspPublisherManager
+from src.demux_rtsp_publisher import DemuxRtspPublisher
 from src.common import load_config
 from api.camera_api import CameraAPIServer
 from api.shutdown import setup_signal_handlers, wait_for_shutdown
@@ -63,8 +64,12 @@ def main():
     # Create camera manager for dynamic camera control
     manager = MultibranchCameraManager(pipeline, builder.branches)
 
-    # Create RTSP publisher for on-demand streaming
+    # Create RTSP publisher for on-demand streaming (full branch)
     rtsp_publisher = RtspPublisherManager(pipeline, builder.branches)
+
+    # Create per-camera RTSP publisher using demux (annotated streams)
+    per_camera_rtsp = DemuxRtspPublisher(pipeline, builder.branches, manager)
+    print("[RTSP] Using DemuxRtspPublisher (annotated per-camera streams)")
 
     # Setup signal handlers for graceful shutdown
     setup_signal_handlers()
@@ -93,8 +98,13 @@ def main():
     # Start processors after pipeline is ready
     builder.start_processors()
 
-    # Start camera API server with RTSP publisher
-    api = CameraAPIServer(config.get("camera_api", {}), manager, rtsp_publisher)
+    # Start camera API server with RTSP publishers
+    api = CameraAPIServer(
+        config.get("camera_api", {}),
+        manager,
+        rtsp_publisher=rtsp_publisher,
+        demux_rtsp_publisher=per_camera_rtsp
+    )
     api.start()
 
     # Wait for shutdown signal
