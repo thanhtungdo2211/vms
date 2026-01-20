@@ -95,3 +95,10 @@ ffplay rtsp://192.168.6.14:8554/cam2_recognition
 
 cảm giác chạy không được ổn định với kịch bản dưới đây: [Pasted text #3 +63 lines] Thỉnh thoảng khi Start Per-Camera RTSP
   Publishing o 1 camera nao do lai bi lỗi. Hãy giúp tôi debug và fix chuyên sâu
+
+
+Giup toi comprehensive test CRUD camera, CRUD rtsp Publishing
+    - Test nhieu lan
+    - dam bao pipeline hoat dong on dinh, khong crash, khong segmetation fault
+    - test CRUD camera it nhat 5 cam vao cac branch
+    - test rtsp Publishing it nhat 5 cam

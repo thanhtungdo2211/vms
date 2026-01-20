@@ -539,7 +539,13 @@ class MultibranchCameraManager:
                 return False
 
     def remove_camera_from_branch(self, camera_id: str, branch_name: str) -> bool:
-        """Remove camera from branch."""
+        """Remove camera from branch.
+
+        STABILITY FIX (2026-01-20):
+        - When this would leave a branch empty (while other branches have cameras),
+          pause the pipeline to prevent CUDA race conditions with nvstreammux.
+        - This is critical because nvstreammux with 0 sources triggers inference errors.
+        """
         with self._lock:
             self._delay()
             cam = self._cameras.get(camera_id)
@@ -554,7 +560,35 @@ class MultibranchCameraManager:
                 return False
 
             logger.info(f"[CAM-MANAGER] Starting to remove {camera_id} from branch {branch_name}")
+
+            # Check if this will leave the branch empty
+            b = self.branches.get(branch_name)
+            branch_camera_count = 0
+            if b and b.nvstreammux:
+                it = b.nvstreammux.iterate_sink_pads()
+                while True:
+                    result, pad = it.next()
+                    if result == Gst.IteratorResult.OK:
+                        if pad.is_linked():
+                            branch_camera_count += 1
+                    elif result == Gst.IteratorResult.RESYNC:
+                        it.resync()
+                        branch_camera_count = 0
+                    else:
+                        break
+
+            will_empty_branch = branch_camera_count <= 1
+            _, prev_state, _ = self.pipeline.get_state(0)
+
             try:
+                # STABILITY FIX: Pause pipeline if this will empty the branch
+                # This prevents CUDA race conditions when nvstreammux becomes empty
+                if will_empty_branch and prev_state == Gst.State.PLAYING:
+                    logger.info(f"[CAM-MANAGER] Pausing pipeline - branch {branch_name} will become empty")
+                    self.pipeline.set_state(Gst.State.PAUSED)
+                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
+                    time.sleep(0.5)
+
                 tee_pad = cam["branch_pads"].get(branch_name)
 
                 # Step 1: Block the tee src pad to stop data flow
@@ -576,11 +610,20 @@ class MultibranchCameraManager:
                 # Step 2: Unlink the branch elements (safe now that data is blocked)
                 self._unlink_branch_safe(cam, branch_name, camera_id, tee_pad, probe_id)
 
+                # Resume pipeline if we paused it
+                if will_empty_branch and prev_state == Gst.State.PLAYING:
+                    logger.info(f"[CAM-MANAGER] Resuming pipeline after branch removal")
+                    self.pipeline.set_state(Gst.State.PLAYING)
+                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
+
                 self._last_op = time.time()
                 logger.info(f"[CAM-MANAGER] Successfully removed {camera_id} from branch {branch_name}")
                 return True
             except Exception as e:
                 logger.error(f"[CAM-MANAGER] remove_camera_from_branch failed: {e}", exc_info=True)
+                # Try to restore pipeline state
+                if will_empty_branch and prev_state == Gst.State.PLAYING:
+                    self.pipeline.set_state(Gst.State.PLAYING)
                 return False
 
     def _link_branch(self, bin_elem, tee, camera_id, source_id, branch_name, sync=False) -> Gst.Pad:
@@ -768,40 +811,98 @@ class MultibranchCameraManager:
     def kill_all(self) -> int:
         """Remove all cameras - requires pipeline restart to add cameras again.
 
-        Note: Due to DeepStream/CUDA buffer management, killing all cameras
-        while pipeline is running causes CUDA errors. For clean restart,
-        use stop() then restart the pipeline process.
+        STABILITY FIX (2026-01-20):
+        - Send EOS event to nvstreammux to signal end of stream
+        - Wait for EOS to propagate (allows CUDA operations to complete)
+        - Use incremental state transition: PLAYING -> PAUSED -> NULL
+        - Add probes to block data flow before state change
+        This prevents CUDA race conditions during cleanup.
         """
         with self._lock:
             if not self._cameras:
                 return 0
 
-            # Set pipeline to NULL to properly release all CUDA resources
-            # This is the safest way to remove all cameras without CUDA errors
-            logger.info("[CAM-MANAGER] Setting pipeline to NULL for clean kill_all")
-            self.pipeline.set_state(Gst.State.NULL)
-            self.pipeline.get_state(10 * Gst.SECOND)
-            time.sleep(1.0)  # Allow CUDA resources to be released
+            n = len(self._cameras)
+            logger.info(f"[CAM-MANAGER] kill_all starting - removing {n} cameras")
 
+            # STEP 1: Get current state
+            _, current_state, _ = self.pipeline.get_state(0)
+            logger.info(f"[CAM-MANAGER] Current pipeline state: {current_state.value_nick}")
+
+            # STEP 2: Send EOS to all nvstreammux elements to signal end of stream
+            # This allows inference engines to complete their CUDA operations gracefully
+            logger.info("[CAM-MANAGER] Sending EOS to all branches...")
+            for branch_name, branch in self.branches.items():
+                if branch.nvstreammux:
+                    # Send EOS downstream from nvstreammux
+                    branch.nvstreammux.send_event(Gst.Event.new_eos())
+                    logger.debug(f"[CAM-MANAGER] Sent EOS to {branch_name} nvstreammux")
+
+            # Wait for EOS to propagate
+            time.sleep(2.0)
+
+            # STEP 3: Add blocking probes to all camera tees to stop any remaining data flow
+            block_probes = []
+            for camera_id, cam in self._cameras.items():
+                tee = cam.get("tee")
+                if tee:
+                    sink_pad = tee.get_static_pad("sink")
+                    if sink_pad:
+                        def make_block_probe():
+                            def probe_fn(pad, info):
+                                return Gst.PadProbeReturn.DROP
+                            return probe_fn
+
+                        probe_fn = make_block_probe()
+                        probe_id = sink_pad.add_probe(Gst.PadProbeType.BUFFER, probe_fn)
+                        block_probes.append((sink_pad, probe_id))
+
+            time.sleep(0.5)
+
+            # STEP 4: Transition to PAUSED first
+            if current_state == Gst.State.PLAYING:
+                logger.info("[CAM-MANAGER] Transitioning to PAUSED...")
+                self.pipeline.set_state(Gst.State.PAUSED)
+                ret, _, _ = self.pipeline.get_state(10 * Gst.SECOND)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    logger.warning("[CAM-MANAGER] PAUSED transition warning")
+                time.sleep(2.0)  # Allow CUDA operations to complete
+
+            # STEP 5: Transition to NULL state
+            logger.info("[CAM-MANAGER] Transitioning to NULL...")
+            self.pipeline.set_state(Gst.State.NULL)
+            ret, _, _ = self.pipeline.get_state(10 * Gst.SECOND)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                logger.warning("[CAM-MANAGER] NULL transition warning")
+            time.sleep(2.0)  # Allow CUDA resources to be fully released
+
+            # STEP 6: Remove blocking probes
+            for sink_pad, probe_id in block_probes:
+                try:
+                    sink_pad.remove_probe(probe_id)
+                except Exception:
+                    pass
+
+            # STEP 7: Cleanup camera bins (skip unlink since pipeline is already NULL)
             for camera_id, cam in list(self._cameras.items()):
                 try:
-                    # Unlink from all branches and release mux pads
-                    for branch_name in list(cam["branch_pads"].keys()):
-                        self._unlink_branch(cam, branch_name, camera_id)
-
-                    # Remove bin from pipeline
+                    # Since pipeline is NULL, just remove the bin directly
+                    cam["bin"].set_state(Gst.State.NULL)
                     self.pipeline.remove(cam["bin"])
+                    logger.debug(f"[CAM-MANAGER] Removed camera bin: {camera_id}")
                 except Exception as e:
-                    logger.warning(f"[CAM-MANAGER] kill_all error for {camera_id}: {e}")
+                    logger.warning(f"[CAM-MANAGER] kill_all cleanup error for {camera_id}: {e}")
 
-            n = len(self._cameras)
             self._cameras.clear()
             self._mapper.clear()
 
-            # Transition pipeline back to READY (waiting for new cameras)
-            logger.info("[CAM-MANAGER] Setting pipeline to READY after kill_all")
+            # STEP 8: Transition pipeline back to READY (waiting for new cameras)
+            logger.info("[CAM-MANAGER] Transitioning to READY...")
             self.pipeline.set_state(Gst.State.READY)
-            self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
+            ret, _, _ = self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                logger.warning("[CAM-MANAGER] READY transition warning")
 
             self._last_op = time.time()
+            logger.info(f"[CAM-MANAGER] kill_all completed - removed {n} cameras")
             return n
