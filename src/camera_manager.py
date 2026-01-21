@@ -245,30 +245,13 @@ class MultibranchCameraManager:
 
                 # STEP 3: Link to branches FIRST (before state sync) - like reference implementation
                 # Link while bin is in NULL state for safe topology change
+                # NOTE: DROP probe logic removed - warmup pre-loads engines, no race condition
                 branch_pads = {}
-                branch_drop_flags = {}  # Store drop flags for each branch (except first)
 
                 for idx, b in enumerate(branches):
                     logger.info(f"[CAM-MANAGER] Linking branch {idx+1}/{len(branches)}: {b}")
                     pad = self._link_branch(bin_elem, tee, camera_id, source_id, b, sync=False)  # Don't sync yet
                     branch_pads[b] = pad
-
-                    # For FIRST camera only: add controlled DROP probe on non-first branches
-                    # This prevents race conditions during initial pipeline startup
-                    # For additional cameras, pipeline is already stable - no DROP needed
-                    if is_first_camera and len(branches) > 1 and idx > 0:
-                        drop_flag = [True]
-
-                        def make_probe_fn(flag):
-                            def probe_fn(p, info):
-                                if flag[0]:
-                                    return Gst.PadProbeReturn.DROP
-                                return Gst.PadProbeReturn.OK
-                            return probe_fn
-
-                        probe_id = pad.add_probe(Gst.PadProbeType.BUFFER, make_probe_fn(drop_flag))
-                        branch_drop_flags[b] = (pad, probe_id, drop_flag)
-                        logger.debug(f"[CAM-MANAGER] Added DROP probe to branch {b}")
 
                 # STEP 4: Now sync camera bin state (with branches already linked)
                 logger.info(f"[CAM-MANAGER] Syncing camera bin to pipeline state")
@@ -322,25 +305,6 @@ class MultibranchCameraManager:
                     if ret == Gst.StateChangeReturn.FAILURE:
                         logger.warning(f"[CAM-MANAGER] Pipeline PLAYING transition returned FAILURE (may still work)")
 
-                    # STEP 7: Release DROP probes on remaining branches SEQUENTIALLY
-                    # Key fix: Let first branch's inference engine initialize before starting others
-                    if branch_drop_flags:
-                        # Wait for first branch to fully initialize (process several frames)
-                        time.sleep(2.0)
-                        logger.info(f"[CAM-MANAGER] Enabling remaining branches...")
-                        for idx, (b, (pad, pid, drop_flag)) in enumerate(branch_drop_flags.items()):
-                            logger.info(f"[CAM-MANAGER] Enabling branch: {b}")
-                            # Toggle flag instead of removing probe (safer)
-                            drop_flag[0] = False
-                            # Wait between each branch to allow inference engine initialization
-                            if idx < len(branch_drop_flags) - 1:
-                                time.sleep(1.5)
-                        logger.info(f"[CAM-MANAGER] All branches enabled")
-
-                    ret, _, _ = self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
-                    if ret == Gst.StateChangeReturn.FAILURE:
-                        logger.warning(f"[CAM-MANAGER] Pipeline PLAYING transition returned FAILURE (may still work)")
-
                 elif prev_state == Gst.State.PLAYING:
                     # Additional camera - pipeline was PAUSED in STEP 1
                     logger.info(f"[CAM-MANAGER] Additional camera - resuming pipeline")
@@ -376,16 +340,6 @@ class MultibranchCameraManager:
                     # Wait for camera to connect and stabilize
                     time.sleep(3.0)
                     logger.info(f"[CAM-MANAGER] Additional camera stabilized")
-
-                    # Release DROP probes on non-first branches for additional cameras
-                    if branch_drop_flags:
-                        logger.info(f"[CAM-MANAGER] Enabling remaining branches for additional camera...")
-                        for idx, (b, (pad, pid, drop_flag)) in enumerate(branch_drop_flags.items()):
-                            logger.info(f"[CAM-MANAGER] Enabling branch: {b}")
-                            drop_flag[0] = False
-                            if idx < len(branch_drop_flags) - 1:
-                                time.sleep(0.5)
-                        logger.info(f"[CAM-MANAGER] All branches enabled for additional camera")
 
                 self._last_op = time.time()
                 logger.info(f"[CAM-MANAGER] Successfully added {camera_id} to branches: {branches}")

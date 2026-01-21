@@ -2,6 +2,13 @@ camera_api:
   host: "${API_HOST:0.0.0.0}"
   port: "${API_PORT:8083}"
 
+# Warmup: Pre-load TensorRT engines before first camera
+# This reduces first-camera latency by keeping engines loaded
+warmup:
+  enabled: true
+  timeout: 15.0      # Max wait time for warmup (seconds)
+  num_frames: 64     # Number of warmup frames to process
+
 pipeline:
   name: multi-branch-tee-pipeline
   branches:

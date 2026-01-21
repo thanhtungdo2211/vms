@@ -35,6 +35,7 @@ from gi.repository import Gst
 from src.pipeline_builder import PipelineBuilder
 from src.camera_manager import MultibranchCameraManager
 from src.demux_rtsp_publisher import DemuxRtspPublisher
+from src.warmup_manager import WarmupManager
 from src.common import load_config
 from api.camera_api import CameraAPIServer
 from api.shutdown import setup_signal_handlers, wait_for_shutdown
@@ -67,16 +68,18 @@ def main():
     # Create camera manager for dynamic camera control
     manager = MultibranchCameraManager(pipeline, builder.branches)
 
-    # Create per-camera RTSP publisher using demux (annotated streams)
-    per_camera_rtsp = DemuxRtspPublisher(pipeline, builder.branches, manager)
-    print("[RTSP] Using DemuxRtspPublisher (annotated per-camera streams)")
-
     # Setup signal handlers for graceful shutdown
     setup_signal_handlers()
 
     # Start sinks
     for sink in builder.branch_sinks.values():
         sink.start()
+
+    # Create per-camera RTSP publisher using demux (annotated streams)
+    # NOTE: MUST be created BEFORE pipeline transitions to READY
+    # nvstreamdemux requires pads to be pre-requested in NULL state
+    per_camera_rtsp = DemuxRtspPublisher(pipeline, builder.branches, manager)
+    print("[RTSP] Using DemuxRtspPublisher (annotated per-camera streams)")
 
     # STABILITY FIX: Start in READY state, not PLAYING
     # This prevents crashes from empty nvstreammux
@@ -94,6 +97,18 @@ def main():
         return 1
 
     print("[Pipeline] READY - waiting for cameras...")
+
+    # Warmup: Pre-load TensorRT engines before first camera
+    warmup_config = config.get("warmup", {})
+    if warmup_config.get("enabled", True):
+        print("\n[Warmup] Pre-loading inference engines...")
+        warmup = WarmupManager(pipeline, builder.branches)
+        timeout = warmup_config.get("timeout", 15.0)
+        num_frames = warmup_config.get("num_frames", 64)
+        if warmup.warmup(timeout=timeout, num_frames=num_frames):
+            print("[Warmup] Complete - engines ready")
+        else:
+            print("[Warmup] Warning: warmup failed, first camera may have latency")
 
     # Start processors after pipeline is ready
     builder.start_processors()
