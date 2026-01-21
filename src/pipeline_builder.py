@@ -60,7 +60,6 @@ class PipelineBuilder:
         """Create sinks based on config."""
         from src.sinks.filesink_adapter import FilesinkAdapter
         from src.sinks.fakesink_adapter import FakesinkAdapter
-        from src.sinks.rtsp_sink_adapter import RtspSinkAdapter
 
         sinks = {}
         out_cfg = self.config.get("output", {})
@@ -80,16 +79,6 @@ class PipelineBuilder:
             if s_type == "filesink":
                 loc = s_props.get("location") or f"{out_dir}/output_{name}.avi"
                 sinks[name] = FilesinkAdapter(location=loc)
-            elif s_type == "rtsp":
-                loc = s_props.get("location")
-                if not loc:
-                    # Default local mediamtx if not specified
-                    loc = f"rtsp://localhost:8554/{name}"
-                sinks[name] = RtspSinkAdapter(
-                    location=loc,
-                    bitrate=s_props.get("bitrate", 4000000),
-                    protocols=s_props.get("protocols", "tcp")
-                )
             else:
                 sinks[name] = FakesinkAdapter()
         return sinks

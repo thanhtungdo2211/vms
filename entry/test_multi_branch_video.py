@@ -34,7 +34,6 @@ from gi.repository import Gst
 # Import directly from modules (no __init__.py)
 from src.pipeline_builder import PipelineBuilder
 from src.camera_manager import MultibranchCameraManager
-from src.rtsp_publisher_manager import RtspPublisherManager
 from src.demux_rtsp_publisher import DemuxRtspPublisher
 from src.common import load_config
 from api.camera_api import CameraAPIServer
@@ -67,9 +66,6 @@ def main():
 
     # Create camera manager for dynamic camera control
     manager = MultibranchCameraManager(pipeline, builder.branches)
-
-    # Create RTSP publisher for on-demand streaming (full branch)
-    rtsp_publisher = RtspPublisherManager(pipeline, builder.branches)
 
     # Create per-camera RTSP publisher using demux (annotated streams)
     per_camera_rtsp = DemuxRtspPublisher(pipeline, builder.branches, manager)
@@ -106,7 +102,6 @@ def main():
     api = CameraAPIServer(
         config.get("camera_api", {}),
         manager,
-        rtsp_publisher=rtsp_publisher,
         demux_rtsp_publisher=per_camera_rtsp
     )
     api.start()

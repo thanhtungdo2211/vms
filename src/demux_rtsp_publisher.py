@@ -154,8 +154,7 @@ class DemuxRtspPublisher:
         camera_id: str,
         branch_name: str,
         location: str,
-        bitrate: int = 4000000,
-        max_retries: int = 3
+        bitrate: int = 4000000
     ) -> bool:
         """Start RTSP publishing for specific camera with annotations.
 
@@ -164,7 +163,6 @@ class DemuxRtspPublisher:
             branch_name: Branch with nvstreamdemux
             location: RTSP server URL
             bitrate: H264 encoding bitrate
-            max_retries: Number of retry attempts on failure
 
         Returns:
             True if started successfully
@@ -173,45 +171,12 @@ class DemuxRtspPublisher:
             logger.error(f"[DemuxRTSP] Invalid RTSP URL: {location}")
             return False
 
-        # Retry loop for stability
-        for attempt in range(max_retries):
-            result = self._try_start_publish(camera_id, branch_name, location, bitrate)
-            if result:
-                return True
-
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 1.0  # Exponential backoff: 1s, 2s, 3s
-                logger.warning(f"[DemuxRTSP] Retry {attempt + 1}/{max_retries} for {camera_id}/{branch_name} in {wait_time}s")
-                time.sleep(wait_time)
-
-        logger.error(f"[DemuxRTSP] Failed to start {camera_id}/{branch_name} after {max_retries} attempts")
-        return False
-
-    def _try_start_publish(
-        self,
-        camera_id: str,
-        branch_name: str,
-        location: str,
-        bitrate: int
-    ) -> bool:
-        """Internal method to attempt starting RTSP publish."""
-
         with self._lock:
             key = (camera_id, branch_name)
 
             if key in self._publishers:
                 logger.warning(f"[DemuxRTSP] {camera_id}/{branch_name} already publishing")
                 return True  # Already publishing is success
-
-            # Check pipeline is in PLAYING state before starting RTSP
-            _, state, _ = self.pipeline.get_state(0)
-            if state != Gst.State.PLAYING:
-                logger.warning(f"[DemuxRTSP] Pipeline not PLAYING (state={state.value_nick}), waiting...")
-                time.sleep(1.0)
-                _, state, _ = self.pipeline.get_state(0)
-                if state != Gst.State.PLAYING:
-                    logger.error(f"[DemuxRTSP] Pipeline still not PLAYING after wait")
-                    return False
 
             # Check camera exists and get source_id
             cam = self.camera_manager.get_camera(camera_id)
@@ -230,9 +195,6 @@ class DemuxRtspPublisher:
             try:
                 self._counter += 1
                 prefix = f"demux_rtsp_{camera_id}_{self._counter}"
-
-                # Get pipeline state
-                _, prev_state, _ = self.pipeline.get_state(0)
 
                 # Create RTSP encoding chain
                 elements = self._create_rtsp_chain(prefix, location, bitrate)
@@ -298,9 +260,6 @@ class DemuxRtspPublisher:
                 for elem in elements:
                     elem.sync_state_with_parent()
 
-                # Brief delay to allow elements to fully initialize
-                time.sleep(0.2)
-
                 # Store publish info
                 self._publishers[key] = DemuxPublishInfo(
                     camera_id=camera_id,
@@ -327,9 +286,6 @@ class DemuxRtspPublisher:
                             self.pipeline.remove(elem)
                         except:
                             pass
-
-                if prev_state == Gst.State.PLAYING:
-                    self.pipeline.set_state(Gst.State.PLAYING)
                 return False
 
     def stop_publish(self, camera_id: str, branch_name: str) -> bool:
@@ -467,23 +423,22 @@ class DemuxRtspPublisher:
         """Create RTSP sink element chain with OSD for per-camera streaming."""
         elements = []
 
-        # Queue for buffering - larger buffer to handle timing variations
+        # Queue for buffering
         queue = Gst.ElementFactory.make("queue", f"{prefix}_q")
-        queue.set_property("max-size-buffers", 60)  # Increased from 30
-        queue.set_property("max-size-time", 2 * Gst.SECOND)  # 2 second buffer
-        queue.set_property("leaky", 2)  # Drop old buffers
+        queue.set_property("max-size-buffers", 30)
+        queue.set_property("leaky", 2)
         elements.append(queue)
 
         # OSD - draw annotations on this camera's frames
         osd = Gst.ElementFactory.make("nvdsosd", f"{prefix}_osd")
         if osd:
-            osd.set_property("process-mode", 1)  # CPU mode
+            osd.set_property("process-mode", 0)  # CPU mode
             osd.set_property("display-text", 1)
             elements.append(osd)
         else:
             logger.warning(f"[DemuxRTSP] nvdsosd not available, skipping OSD")
 
-        # Video converter
+        # Video converter - output to system memory for x264enc
         conv = Gst.ElementFactory.make("nvvideoconvert", f"{prefix}_conv")
         if not conv:
             conv = Gst.ElementFactory.make("videoconvert", f"{prefix}_conv")
@@ -492,28 +447,19 @@ class DemuxRtspPublisher:
             conv.set_property("nvbuf-memory-type", 3)
         elements.append(conv)
 
-        # Caps filter - x264enc needs system memory (not NVMM)
+        # Caps filter - x264enc needs system memory (I420), not NVMM
         caps = Gst.ElementFactory.make("capsfilter", f"{prefix}_caps")
         caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
         elements.append(caps)
 
-        # H264 encoder
-        # enc = Gst.ElementFactory.make("nvv4l2h264enc", f"{prefix}_enc")
-        # if not enc:
-        #     enc = Gst.ElementFactory.make("x264enc", f"{prefix}_enc")
-        #     enc.set_property("bitrate", bitrate // 1000)
-        #     enc.set_property("speed-preset", "ultrafast")
-        #     enc.set_property("tune", "zerolatency")
-        # else:
-        #     enc.set_property("bitrate", bitrate)
-        #     enc.set_property("tuning-info-id", 2)
-        #     enc.set_property("iframeinterval", 30)
-        #     enc.set_property("idrinterval", 30)
+        # H264 encoder - use x264enc for stability (works with system memory)
         enc = Gst.ElementFactory.make("x264enc", f"{prefix}_enc")
         enc.set_property("bitrate", bitrate // 1000)
         enc.set_property("speed-preset", "ultrafast")
         enc.set_property("tune", "zerolatency")
-        enc.set_property("threads", 4)  # Use 4 threads for encoding
+        enc.set_property("threads", 2)
+        enc.set_property("bframes", 0)  # No B-frames for low latency
+        enc.set_property("key-int-max", 30)
         elements.append(enc)
 
         # H264 parser
@@ -521,13 +467,12 @@ class DemuxRtspPublisher:
         parse.set_property("config-interval", -1)
         elements.append(parse)
 
-        # RTSP client sink with stability settings
+        # RTSP client sink
         sink = Gst.ElementFactory.make("rtspclientsink", f"{prefix}_sink")
         sink.set_property("location", location)
-        sink.set_property("protocols", 4)  # TCP - more reliable than UDP
-        sink.set_property("latency", 200)  # 200ms latency for stability
+        sink.set_property("protocols", 4)  # TCP
+        sink.set_property("latency", 100)
         sink.set_property("do-rtsp-keep-alive", True)
-        sink.set_property("timeout", 5000000)  # 5 second timeout (microseconds)
         elements.append(sink)
 
         return elements
