@@ -5,8 +5,11 @@ camera_api:
 pipeline:
   name: multi-branch-tee-pipeline
   branches:
-    detection: apps/detection/config.yaml
-    recognition: apps/face/config.yaml
+    # detection: apps/detection/config.yaml
+    # recognition: apps/face/config.yaml
     # plate_recognition: apps/plate/config.yaml
     # area_monitoring: apps/area_monitoring/config.yaml
     # fire_detection: apps/fire_detection/config.yaml
+
+    recognition: apps/face/config-demux.yaml
+    detection: apps/detection/config-demux.yaml

@@ -5,7 +5,5 @@ camera_api:
 pipeline:
   name: multi-branch-demux-pipeline
   branches:
-    # Recognition with demux for per-camera annotated streams
     recognition: apps/face/config-demux.yaml
-    # Detection with demux for per-camera annotated streams
     detection: apps/detection/config-demux.yaml
