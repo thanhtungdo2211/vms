@@ -305,27 +305,10 @@ class MultibranchCameraManager:
                     # First camera - need to start entire pipeline
                     logger.info(f"[CAM-MANAGER] First camera - transitioning pipeline to PLAYING")
 
-                    # Add blocking probe on tee to control first frame timing
-                    first_frame_event = threading.Event()
-                    frame_count = [0]
-
-                    def tee_buffer_probe(pad, info):
-                        frame_count[0] += 1
-                        if frame_count[0] <= 3:  # Block first 3 frames for warmup
-                            logger.debug(f"[CAM-MANAGER] Warmup frame {frame_count[0]}")
-                            return Gst.PadProbeReturn.DROP
-                        if frame_count[0] == 4:
-                            first_frame_event.set()
-                            logger.info(f"[CAM-MANAGER] First valid frame passed for {camera_id}")
-                        return Gst.PadProbeReturn.PASS
-
-                    tee_sink = tee.get_static_pad("sink")
-                    probe_id = tee_sink.add_probe(Gst.PadProbeType.BUFFER, tee_buffer_probe)
-
                     # Set pipeline to PAUSED first (load all elements including branches)
                     logger.info(f"[CAM-MANAGER] Setting pipeline to PAUSED for safe preroll")
                     self.pipeline.set_state(Gst.State.PAUSED)
-                    ret, _, _ = self.pipeline.get_state(10 * Gst.SECOND)  # Wait for PAUSED
+                    ret, _, _ = self.pipeline.get_state(10 * Gst.SECOND)
                     if ret == Gst.StateChangeReturn.FAILURE:
                         logger.warning(f"[CAM-MANAGER] Pipeline PAUSED transition warning")
 
@@ -338,15 +321,6 @@ class MultibranchCameraManager:
                     ret, _, _ = self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
                     if ret == Gst.StateChangeReturn.FAILURE:
                         logger.warning(f"[CAM-MANAGER] Pipeline PLAYING transition returned FAILURE (may still work)")
-
-                    # Wait for first valid frame to pass through
-                    if first_frame_event.wait(timeout=5.0):
-                        logger.info(f"[CAM-MANAGER] Pipeline stable with first frames")
-                    else:
-                        logger.warning(f"[CAM-MANAGER] Timeout waiting for first frame")
-
-                    # Remove warmup probe after stable
-                    tee_sink.remove_probe(probe_id)
 
                     # STEP 7: Release DROP probes on remaining branches SEQUENTIALLY
                     # Key fix: Let first branch's inference engine initialize before starting others
