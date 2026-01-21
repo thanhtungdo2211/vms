@@ -500,42 +500,39 @@ class MultibranchCameraManager:
                 return False
 
     def add_camera_to_branch(self, camera_id: str, branch_name: str) -> bool:
-        """Add camera to additional branch with safe pipeline state management."""
+        """Add camera to additional branch without pausing pipeline.
+
+        FIX (2026-01-21): Removed pipeline PAUSE to prevent RTSP stream failures.
+        Adding a branch link (tee → queue → mux) can be done dynamically:
+        - Tee src pad is requested dynamically
+        - Queue is added with proper state sync
+        - Mux sink pad is requested dynamically
+        This preserves existing RTSP streams that would fail on PAUSE/RESUME.
+        """
         with self._lock:
             self._delay()
             cam = self._cameras.get(camera_id)
             if not cam or branch_name in cam["branch_pads"] or branch_name not in self.branches:
                 return False
 
-            # Get current pipeline state
+            # Get current pipeline state for element sync
             _, prev_state, _ = self.pipeline.get_state(0)
-            logger.info(f"[CAM-MANAGER] Adding {camera_id} to branch {branch_name}")
+            logger.info(f"[CAM-MANAGER] Adding {camera_id} to branch {branch_name} (no pause)")
 
             try:
-                # PAUSE pipeline for safe topology change
-                if prev_state == Gst.State.PLAYING:
-                    self.pipeline.set_state(Gst.State.PAUSED)
-                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
-
-                # Link branch with element state sync
+                # NO PAUSE: Link branch dynamically with element state sync
+                # This is safe because we're only adding new pads/elements
                 pad = self._link_branch(cam["bin"], cam["tee"], camera_id, cam["source_id"], branch_name, True)
                 cam["branch_pads"][branch_name] = pad
 
                 # Update batch size
                 self._update_batch_size(branch_name)
 
-                # Resume pipeline
-                if prev_state == Gst.State.PLAYING:
-                    self.pipeline.set_state(Gst.State.PLAYING)
-                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
-
                 self._last_op = time.time()
                 logger.info(f"[CAM-MANAGER] Successfully added {camera_id} to branch {branch_name}")
                 return True
             except Exception as e:
                 logger.error(f"add_camera_to_branch failed: {e}", exc_info=True)
-                if prev_state == Gst.State.PLAYING:
-                    self.pipeline.set_state(Gst.State.PLAYING)
                 return False
 
     def remove_camera_from_branch(self, camera_id: str, branch_name: str) -> bool:

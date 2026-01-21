@@ -34,7 +34,7 @@ TEST_CAMERAS = [
 ]
 
 BRANCHES = ["detection", "recognition"]
-OPERATION_DELAY = 5.0  # Delay between operations (seconds) - increased for stability
+OPERATION_DELAY = 0.5  # Delay between operations (seconds) - increased for stability
 
 
 @dataclass
@@ -78,7 +78,6 @@ class TestRunner:
             result = self._api_call("GET", f"/api/operations/{op_id}")
             if "status" in result and result["status"] in ("ok", "error"):
                 return result
-            time.sleep(0.5)
         return {"status": "timeout"}
 
     def _check_health(self) -> bool:
@@ -550,7 +549,7 @@ class TestRunner:
 
         # Wait for RTSP to stabilize
         print("  Waiting 10s for RTSP stabilization...")
-        time.sleep(10)
+        time.sleep(2)
 
         # Health check after Step 3
         healthy = self._check_health()
@@ -625,7 +624,7 @@ class TestRunner:
 
         # Wait for recognition RTSP to stabilize
         print("  Waiting 10s for recognition RTSP stabilization...")
-        time.sleep(10)
+        time.sleep(2)
 
         # Health check after Step 5b
         healthy = self._check_health()
