@@ -39,6 +39,11 @@ class MultibranchCameraManager:
         self._lock = threading.Lock()
         self._pad_counter = 0
         self._last_op = 0.0
+        self._rtsp_publisher = None  # DemuxRtspPublisher reference
+
+    def set_rtsp_publisher(self, publisher) -> None:
+        """Set the RTSP publisher for cleanup on camera removal."""
+        self._rtsp_publisher = publisher
 
     def _delay(self):
         """Wait 2s between operations."""
@@ -479,6 +484,10 @@ class MultibranchCameraManager:
                 return False
 
             try:
+                # Cleanup RTSP publisher first (before removing camera resources)
+                if self._rtsp_publisher:
+                    self._rtsp_publisher.cleanup_camera(camera_id)
+
                 for pad in cam["branch_pads"].values():
                     pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, lambda *_: Gst.PadProbeReturn.REMOVE)
                 time.sleep(0.2)

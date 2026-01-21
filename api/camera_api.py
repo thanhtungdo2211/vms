@@ -35,7 +35,17 @@ logger = logging.getLogger(__name__)
 
 
 class CameraAPIServer:
-    MIN_OP_DELAY = 2.0
+    # Operation delays for pipeline stabilization
+    OP_DELAYS = {
+        "add_camera": 3.0,       # Adding camera needs GPU init time
+        "remove_camera": 2.5,    # Removing needs cleanup time
+        "add_branch": 2.0,       # Adding to branch
+        "remove_branch": 2.0,    # Removing from branch
+        "rtsp_start": 2.5,       # RTSP start needs encoder init
+        "rtsp_stop": 1.5,        # RTSP stop is faster
+        "default": 2.0,          # Default delay
+    }
+    MIN_OP_DELAY = 2.0  # Minimum delay between any operations
 
     def __init__(
         self,
@@ -53,17 +63,38 @@ class CameraAPIServer:
         self.op_lock = threading.Lock()
         self._running = True
         self._app = None
+        self._last_op_type = None
+
+    def _get_op_delay(self, op_type: str) -> float:
+        """Get delay for operation type, considering previous operation."""
+        base_delay = self.OP_DELAYS.get(op_type, self.OP_DELAYS["default"])
+
+        # Extra delay after heavy operations
+        if self._last_op_type in ("add_camera", "remove_camera"):
+            base_delay = max(base_delay, 2.5)
+
+        # Extra delay for consecutive RTSP operations
+        if op_type == "rtsp_start" and self._last_op_type == "rtsp_start":
+            base_delay = max(base_delay, 5.0)
+
+        # Extra delay for RTSP after branch modifications (GPU needs more time to stabilize)
+        if op_type == "rtsp_start" and self._last_op_type in ("add_branch", "remove_branch"):
+            base_delay = max(base_delay, 6.0)
+
+        return base_delay
 
     def _process_ops(self):
         while self._running:
             try:
-                op_id, func, args, kwargs = self.op_queue.get(timeout=0.2)
+                op_id, op_type, func, args, kwargs = self.op_queue.get(timeout=0.2)
                 with self.op_lock:
                     now = time.time()
                     elapsed = now - self.last_op
-                    if elapsed < self.min_delay:
-                        time.sleep(self.min_delay - elapsed)
+                    delay = self._get_op_delay(op_type)
+                    if elapsed < delay:
+                        time.sleep(delay - elapsed)
                     self.last_op = time.time()
+                    self._last_op_type = op_type
 
                 try:
                     result = func(*args, **kwargs)
@@ -125,19 +156,19 @@ class CameraAPIServer:
             uri = request.uri
             branches = request.branches
             op_id = str(uuid.uuid4())[:8]
-            self.op_queue.put((op_id, self.manager.add_camera, (camera_id, uri, branches), {}))
+            self.op_queue.put((op_id, "add_camera", self.manager.add_camera, (camera_id, uri, branches), {}))
             return {"status": "accepted", "operation_id": op_id}
 
         @app.post("/api/pipeline/kill")
         async def kill_pipeline():
             import uuid
             op_id = str(uuid.uuid4())[:8]
-            self.op_queue.put((op_id, self.manager.kill_all, (), {}))
+            self.op_queue.put((op_id, "remove_camera", self.manager.kill_all, (), {}))
             return {"status": "accepted", "operation_id": op_id}
 
         @app.post("/api/pipeline/stop")
         async def stop_pipeline():
-            self.op_queue.put(("stop", self.manager.kill_all, (), {}))
+            self.op_queue.put(("stop", "default", self.manager.kill_all, (), {}))
             if self.shutdown_event:
                 self.shutdown_event.set()
             return {"status": "ok", "message": "shutdown"}
@@ -146,21 +177,21 @@ class CameraAPIServer:
         async def remove_camera(camera_id: str):
             import uuid
             op_id = str(uuid.uuid4())[:8]
-            self.op_queue.put((op_id, self.manager.remove_camera, (camera_id,), {}))
+            self.op_queue.put((op_id, "remove_camera", self.manager.remove_camera, (camera_id,), {}))
             return {"status": "accepted", "operation_id": op_id}
 
         @app.post("/api/cameras/{camera_id}/branches/{branch_name}")
         async def add_camera_to_branch(camera_id: str, branch_name: str):
             import uuid
             op_id = str(uuid.uuid4())[:8]
-            self.op_queue.put((op_id, self.manager.add_camera_to_branch, (camera_id, branch_name), {}))
+            self.op_queue.put((op_id, "add_branch", self.manager.add_camera_to_branch, (camera_id, branch_name), {}))
             return {"status": "accepted", "operation_id": op_id}
 
         @app.delete("/api/cameras/{camera_id}/branches/{branch_name}")
         async def remove_camera_from_branch(camera_id: str, branch_name: str):
             import uuid
             op_id = str(uuid.uuid4())[:8]
-            self.op_queue.put((op_id, self.manager.remove_camera_from_branch, (camera_id, branch_name), {}))
+            self.op_queue.put((op_id, "remove_branch", self.manager.remove_camera_from_branch, (camera_id, branch_name), {}))
             return {"status": "accepted", "operation_id": op_id}
 
         # RTSP Publishing Endpoints
@@ -181,6 +212,7 @@ class CameraAPIServer:
             op_id = str(uuid.uuid4())[:8]
             self.op_queue.put((
                 op_id,
+                "rtsp_start",
                 self.demux_rtsp_publisher.start_publish,
                 (camera_id, branch_name, request.location, request.bitrate),
                 {}
@@ -195,6 +227,7 @@ class CameraAPIServer:
             op_id = str(uuid.uuid4())[:8]
             self.op_queue.put((
                 op_id,
+                "rtsp_stop",
                 self.demux_rtsp_publisher.stop_publish,
                 (camera_id, branch_name),
                 {}

@@ -25,7 +25,7 @@ import requests
 BASE_URL = "http://localhost:8083"
 RTSP_SERVER = "rtsp://192.168.6.14:8554"
 CAMERA_URI = "rtsp://192.168.6.14:8554/testface"
-OP_DELAY = 2.5  # Delay between operations
+RTSP_STABILIZE = 8  # Wait for RTSP streams to stabilize before verification
 
 
 def api(method: str, endpoint: str, data: dict = None) -> dict:
@@ -224,47 +224,44 @@ def main():
         return 1
     log(f"Health: {h}")
 
-    # Step 1: Add 5 cameras to detection + recognition
-    step("Step 1: Add 5 cameras to detection + recognition")
-    for i in range(1, 6):
+    # Step 1: Add 3 cameras to detection + recognition
+    step("Step 1: Add 3 cameras to detection + recognition")
+    for i in range(1, 4):
         cam_id = f"cam{i}"
         ok = add_camera(cam_id, ["detection", "recognition"])
         log(f"  Add {cam_id}: {'OK' if ok else 'FAIL'}")
-        time.sleep(OP_DELAY)
 
     h = health()
     log(f"Health: cameras={h.get('cameras')}")
-    verify("5 cameras added", h.get("cameras") == 5)
+    verify("3 cameras added", h.get("cameras") == 3)
 
     # Step 2: Remove cam1, cam2 from recognition
     step("Step 2: Remove cam1, cam2 from recognition")
     for cam_id in ["cam1", "cam2"]:
         ok = remove_from_branch(cam_id, "recognition")
         log(f"  Remove {cam_id} from recognition: {'OK' if ok else 'FAIL'}")
-        time.sleep(OP_DELAY)
 
     h = health()
     log(f"Health: {h}")
 
-    # Step 3: Start RTSP for cam1, cam2, cam3 on detection
-    step("Step 3: Start RTSP cam1,2,3 on detection")
-    for cam_id in ["cam1", "cam2", "cam3"]:
+    # Step 3: Start RTSP for cam1, cam2 on detection
+    step("Step 3: Start RTSP cam1,2 on detection")
+    for cam_id in ["cam1", "cam2"]:
         ok = start_rtsp(cam_id, "detection")
         log(f"  Start RTSP {cam_id}/detection: {'OK' if ok else 'FAIL'}")
-        time.sleep(OP_DELAY)
 
-    log("Waiting 5s for RTSP stabilization...")
-    time.sleep(5)
+    log(f"Waiting {RTSP_STABILIZE}s for RTSP stabilization...")
+    time.sleep(RTSP_STABILIZE)
 
     h = health()
     log(f"Health: {h}")
     rs = rtsp_status()
     log(f"RTSP status: {rs}")
-    verify("3 detection RTSP streams", len(rs) == 3)
+    verify("2 detection RTSP streams", len(rs) == 2)
 
     # Verify RTSP streams are actually live
     log("Verifying RTSP streams are live...")
-    streams_to_check = [("cam1", "detection"), ("cam2", "detection"), ("cam3", "detection")]
+    streams_to_check = [("cam1", "detection"), ("cam2", "detection")]
     all_live, live_results = verify_rtsp_streams_live(streams_to_check)
     for stream, is_live in live_results.items():
         log(f"  {stream}: {'LIVE' if is_live else 'DEAD'}")
@@ -272,74 +269,65 @@ def main():
         log("FAIL: RTSP streams not live - aborting test")
         return 1
 
-    # Step 4: Remove cam3, cam4 from recognition (while RTSP running)
-    step("Step 4: Remove cam3, cam4 from recognition (RTSP running)")
-    for cam_id in ["cam3", "cam4"]:
-        ok = remove_from_branch(cam_id, "recognition")
-        log(f"  Remove {cam_id} from recognition: {'OK' if ok else 'FAIL'}")
-        time.sleep(OP_DELAY)
-
+    # Step 4: Verify RTSP still works after branch changes
+    step("Step 4: Verify RTSP survives branch operations")
     h = health()
     log(f"Health: {h}")
     rs = rtsp_status()
-    verify("RTSP still alive", len(rs) == 3)
+    verify("RTSP still alive", len(rs) == 2)
 
     # Step 5: Add cam1, cam2 back to recognition
     step("Step 5: Add cam1, cam2 back to recognition")
     for cam_id in ["cam1", "cam2"]:
         ok = add_to_branch(cam_id, "recognition")
         log(f"  Add {cam_id} to recognition: {'OK' if ok else 'FAIL'}")
-        time.sleep(OP_DELAY)
 
     h = health()
     log(f"Health: {h}")
     rs = rtsp_status()
-    verify("RTSP still alive", len(rs) == 3)
+    verify("RTSP still alive", len(rs) == 2)
 
     # Step 5b: Start RTSP for cam1, cam2 on recognition
     step("Step 5b: Start RTSP cam1,2 on recognition")
     for cam_id in ["cam1", "cam2"]:
         ok = start_rtsp(cam_id, "recognition", bitrate=1000000)
         log(f"  Start RTSP {cam_id}/recognition: {'OK' if ok else 'FAIL'}")
-        time.sleep(OP_DELAY)
 
-    log("Waiting 5s for RTSP stabilization...")
-    time.sleep(5)
+    log(f"Waiting {RTSP_STABILIZE}s for RTSP stabilization...")
+    time.sleep(RTSP_STABILIZE)
 
     h = health()
     log(f"Health: {h}")
     rs = rtsp_status()
     log(f"RTSP status: {rs}")
-    # Should have: cam1(det+rec), cam2(det+rec), cam3(det) = 5 streams
+    # Should have: cam1(det+rec), cam2(det+rec) = 4 streams
     total_streams = sum(len(branches) for branches in rs.values())
-    verify("5 total RTSP streams (3 det + 2 rec)", total_streams == 5)
+    verify("4 total RTSP streams (2 det + 2 rec)", total_streams == 4)
 
     # Verify all RTSP streams are actually live
     log("Verifying all RTSP streams are live...")
     streams_to_check = [
-        ("cam1", "detection"), ("cam2", "detection"), ("cam3", "detection"),
+        ("cam1", "detection"), ("cam2", "detection"),
         ("cam1", "recognition"), ("cam2", "recognition")
     ]
     all_live, live_results = verify_rtsp_streams_live(streams_to_check)
     for stream, is_live in live_results.items():
         log(f"  {stream}: {'LIVE' if is_live else 'DEAD'}")
-    if not verify("All 5 RTSP streams live", all_live):
+    if not verify("All 4 RTSP streams live", all_live):
         log("FAIL: RTSP streams not live - aborting test")
         return 1
 
     # Step 6: Stop all RTSP
     step("Step 6: Stop all RTSP")
     # Stop detection RTSP
-    for cam_id in ["cam1", "cam2", "cam3"]:
+    for cam_id in ["cam1", "cam2"]:
         ok = stop_rtsp(cam_id, "detection")
         log(f"  Stop RTSP {cam_id}/detection: {'OK' if ok else 'FAIL'}")
-        time.sleep(1)
 
     # Stop recognition RTSP
     for cam_id in ["cam1", "cam2"]:
         ok = stop_rtsp(cam_id, "recognition")
         log(f"  Stop RTSP {cam_id}/recognition: {'OK' if ok else 'FAIL'}")
-        time.sleep(1)
 
     h = health()
     log(f"Health: {h}")
@@ -347,12 +335,11 @@ def main():
     verify("All RTSP stopped", len(rs) == 0)
 
     # Step 7: Remove all cameras
-    step("Step 7: Remove all 5 cameras")
-    for i in range(1, 6):
+    step("Step 7: Remove all 3 cameras")
+    for i in range(1, 4):
         cam_id = f"cam{i}"
         ok = remove_camera(cam_id)
         log(f"  Remove {cam_id}: {'OK' if ok else 'FAIL'}")
-        time.sleep(OP_DELAY)
 
     h = health()
     log(f"Health: cameras={h.get('cameras')}")

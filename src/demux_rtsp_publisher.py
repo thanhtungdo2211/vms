@@ -244,21 +244,58 @@ class DemuxRtspPublisher:
                     else:
                         logger.warning(f"[DemuxRTSP] Failed to request pad {pad_name}")
 
-                # Link queue sink to demux src
+                # Get queue sink pad for linking
                 queue = elements[0]
                 queue_sink = queue.get_static_pad("sink")
 
-                if demux_src:
-                    # Pad exists - link directly
-                    if demux_src.link(queue_sink) != Gst.PadLinkReturn.OK:
-                        raise RuntimeError(f"Failed to link demux pad {pad_name} to queue")
-                    logger.info(f"[DemuxRTSP] Linked {pad_name} to RTSP chain")
-                else:
+                if not demux_src:
                     raise RuntimeError(f"Could not get or request pad {pad_name}")
 
-                # Sync element states
+                # === CRITICAL: State transition BEFORE linking to demux ===
+                # Elements must be at least PAUSED before receiving data from
+                # the demux pad which is already in PLAYING state.
+                # This prevents data from being dropped during state transitions.
+
+                _, pipeline_state, _ = self.pipeline.get_state(0)
+                logger.info(f"[DemuxRTSP] Pipeline state: {pipeline_state}, transitioning elements...")
+
+                # Step 1: Transition all elements to READY
                 for elem in elements:
-                    elem.sync_state_with_parent()
+                    ret = elem.set_state(Gst.State.READY)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        logger.warning(f"[DemuxRTSP] {elem.get_name()} failed to go READY")
+                    elem.get_state(STATE_CHANGE_TIMEOUT)
+
+                time.sleep(0.1)
+
+                # Step 2: Transition all elements to PAUSED (allows caps negotiation)
+                for elem in elements:
+                    ret = elem.set_state(Gst.State.PAUSED)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        logger.warning(f"[DemuxRTSP] {elem.get_name()} failed to go PAUSED")
+                    # Don't wait for async state change here - PAUSED may block
+                    elem.get_state(Gst.CLOCK_TIME_NONE)  # Non-blocking check
+
+                time.sleep(0.2)
+
+                # Step 3: NOW link to demux (elements are ready to receive data)
+                link_result = demux_src.link(queue_sink)
+                if link_result != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f"Failed to link demux pad {pad_name} to queue: {link_result}")
+                logger.info(f"[DemuxRTSP] Linked {pad_name} to RTSP chain")
+
+                # Step 4: Transition to PLAYING (data will now flow)
+                time.sleep(0.2)
+
+                if pipeline_state == Gst.State.PLAYING:
+                    for elem in elements:
+                        ret = elem.set_state(Gst.State.PLAYING)
+                        if ret == Gst.StateChangeReturn.FAILURE:
+                            logger.warning(f"[DemuxRTSP] {elem.get_name()} failed to go PLAYING")
+                        elem.get_state(STATE_CHANGE_TIMEOUT)
+
+                # Brief delay for elements to stabilize
+                time.sleep(0.3)
 
                 # Store publish info
                 self._publishers[key] = DemuxPublishInfo(
@@ -423,16 +460,17 @@ class DemuxRtspPublisher:
         """Create RTSP sink element chain with OSD for per-camera streaming."""
         elements = []
 
-        # Queue for buffering
+        # Queue for buffering - larger buffer to handle timing variations
         queue = Gst.ElementFactory.make("queue", f"{prefix}_q")
-        queue.set_property("max-size-buffers", 30)
-        queue.set_property("leaky", 2)
+        queue.set_property("max-size-buffers", 60)  # Increased from 30
+        queue.set_property("max-size-time", 2 * Gst.SECOND)  # 2 second buffer
+        queue.set_property("leaky", 2)  # Drop old buffers
         elements.append(queue)
 
         # OSD - draw annotations on this camera's frames
         osd = Gst.ElementFactory.make("nvdsosd", f"{prefix}_osd")
         if osd:
-            osd.set_property("process-mode", 0)  # CPU mode
+            osd.set_property("process-mode", 1)  # GPU mode for better performance
             osd.set_property("display-text", 1)
             elements.append(osd)
         else:
@@ -457,7 +495,7 @@ class DemuxRtspPublisher:
         enc.set_property("bitrate", bitrate // 1000)
         enc.set_property("speed-preset", "ultrafast")
         enc.set_property("tune", "zerolatency")
-        enc.set_property("threads", 2)
+        enc.set_property("threads", 4)  # Use 4 threads for encoding
         enc.set_property("bframes", 0)  # No B-frames for low latency
         enc.set_property("key-int-max", 30)
         elements.append(enc)
@@ -467,12 +505,13 @@ class DemuxRtspPublisher:
         parse.set_property("config-interval", -1)
         elements.append(parse)
 
-        # RTSP client sink
+        # RTSP client sink with stability settings
         sink = Gst.ElementFactory.make("rtspclientsink", f"{prefix}_sink")
         sink.set_property("location", location)
-        sink.set_property("protocols", 4)  # TCP
-        sink.set_property("latency", 100)
+        sink.set_property("protocols", 4)  # TCP - more reliable than UDP
+        sink.set_property("latency", 200)  # 200ms latency for stability
         sink.set_property("do-rtsp-keep-alive", True)
+        sink.set_property("timeout", 5000000)  # 5 second timeout (microseconds)
         elements.append(sink)
 
         return elements
