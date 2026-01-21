@@ -89,41 +89,6 @@ class MultibranchCameraManager:
 
         return True
 
-    def _update_batch_size(self, branch_name: str) -> None:
-        """Update nvstreammux batch-size after camera add/remove.
-
-        Uses iterator RESYNC handling for concurrent modifications.
-        Reference: duy/tks_prj/infra/deepstream/services/camera_manager.py
-        """
-        b = self.branches.get(branch_name)
-        if not b or not b.nvstreammux:
-            return
-
-        streammux = b.nvstreammux
-        connected_count = 0
-        iterator = streammux.iterate_sink_pads()
-
-        while True:
-            result, pad = iterator.next()
-            if result == Gst.IteratorResult.OK:
-                if pad.is_linked():
-                    connected_count += 1
-            elif result == Gst.IteratorResult.RESYNC:
-                # Iterator modified during iteration - restart count
-                iterator.resync()
-                connected_count = 0
-                continue
-            elif result == Gst.IteratorResult.ERROR:
-                logger.warning(f"[CAM-MANAGER] Iterator error in _update_batch_size for {branch_name}")
-                break
-            else:  # DONE
-                break
-
-        current_batch_size = streammux.get_property('batch-size')
-        if connected_count > 0 and connected_count != current_batch_size:
-            # DISABLED: Dynamic batch-size update may cause crashes in custom inference lib
-            # streammux.set_property('batch-size', connected_count)
-            logger.info(f"[CAM-MANAGER] Skipping batch-size update for {branch_name} (keeping {current_batch_size})")
 
     def add_camera(self, camera_id: str, uri: str, branch_names: list[str]) -> bool:
         """Add camera to branches with safe pipeline state management.
@@ -367,10 +332,6 @@ class MultibranchCameraManager:
                     # Wait for nvurisrcbin to connect and negotiate caps
                     time.sleep(2.0)
 
-                    # Update batch sizes AFTER source is connected but BEFORE playing
-                    for b in branches:
-                        self._update_batch_size(b)
-
                     # Now set to PLAYING
                     logger.info(f"[CAM-MANAGER] Setting pipeline to PLAYING")
                     self.pipeline.set_state(Gst.State.PLAYING)
@@ -409,10 +370,6 @@ class MultibranchCameraManager:
                 elif prev_state == Gst.State.PLAYING:
                     # Additional camera - pipeline was PAUSED in STEP 1
                     logger.info(f"[CAM-MANAGER] Additional camera - resuming pipeline")
-
-                    # Update batch sizes
-                    for b in branches:
-                        self._update_batch_size(b)
 
                     # Unified state transition order for both file and RTSP:
                     # 1. Resume pipeline to PLAYING first
@@ -476,7 +433,14 @@ class MultibranchCameraManager:
                 return False
 
     def remove_camera(self, camera_id: str) -> bool:
-        """Remove camera from all branches."""
+        """Remove camera from all branches with proper buffer drain.
+
+        Uses blocking probes to stop data flow, then drains buffers before
+        destroying decoder to prevent CUDA memory corruption.
+
+        When removing the last camera, pauses pipeline first to prevent
+        nvstreammux/nvinfer CUDA errors with empty input.
+        """
         with self._lock:
             self._delay()
             cam = self._cameras.get(camera_id)
@@ -484,28 +448,83 @@ class MultibranchCameraManager:
                 return False
 
             try:
-                # Cleanup RTSP publisher first (before removing camera resources)
+                logger.info(f"[CAM-MANAGER] Removing camera {camera_id}...")
+
+                # Check if this is the last camera - need special handling
+                is_last_camera = len(self._cameras) == 1
+                prev_state = Gst.State.NULL
+
+                if is_last_camera:
+                    # For last camera, set pipeline to NULL BEFORE removing
+                    # This forces TensorRT/CUDA cleanup while camera is still linked
+                    # preventing race conditions with buffer cleanup
+                    _, prev_state, _ = self.pipeline.get_state(0)
+                    logger.info(f"[CAM-MANAGER] Last camera - setting pipeline to NULL first")
+                    self.pipeline.set_state(Gst.State.NULL)
+                    self.pipeline.get_state(5 * Gst.SECOND)
+                    # Wait for GPU cleanup to complete
+                    time.sleep(0.5)
+
+                # Step 1: Cleanup RTSP publisher first (before removing camera resources)
                 if self._rtsp_publisher:
                     self._rtsp_publisher.cleanup_camera(camera_id)
 
-                for pad in cam["branch_pads"].values():
-                    pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, lambda *_: Gst.PadProbeReturn.REMOVE)
-                time.sleep(0.2)
+                # Step 2: Add blocking probes on all branch pads (BLOCK, not REMOVE)
+                # This stops new data from entering downstream while we drain
+                probe_ids = {}
+                for branch_name, pad in cam["branch_pads"].items():
+                    pid = pad.add_probe(
+                        Gst.PadProbeType.BLOCK_DOWNSTREAM,
+                        lambda *_: Gst.PadProbeReturn.OK  # Block indefinitely
+                    )
+                    probe_ids[branch_name] = (pad, pid)
+                    logger.debug(f"[CAM-MANAGER] Blocked {camera_id} on branch {branch_name}")
 
+                # Step 3: Send EOS to camera bin to flush decoder buffers
+                # EOS propagates through decoder, flushing all in-flight buffers
+                cam["bin"].send_event(Gst.Event.new_eos())
+
+                # Step 4: Wait for buffers to drain from decoder
+                # nvv4l2decoder needs time to process remaining buffers
+                time.sleep(0.8)
+
+                # Step 5: Set bin to NULL state (closes decoder FDs safely)
                 cam["bin"].set_state(Gst.State.NULL)
-                cam["bin"].get_state(Gst.CLOCK_TIME_NONE)
+                ret, _, _ = cam["bin"].get_state(2 * Gst.SECOND)
+                if ret != Gst.StateChangeReturn.SUCCESS:
+                    logger.warning(f"[CAM-MANAGER] Camera bin NULL state change: {ret}")
 
+                # Step 6: Remove blocking probes
+                for branch_name, (pad, pid) in probe_ids.items():
+                    try:
+                        pad.remove_probe(pid)
+                    except Exception:
+                        pass  # Pad may already be unlinked
+
+                # Step 7: Unlink from all branches
                 for b in list(cam["branch_pads"].keys()):
                     self._unlink_branch(cam, b, camera_id)
 
+                # Step 8: Remove bin from pipeline
                 self.pipeline.remove(cam["bin"])
                 self._mapper.remove(camera_id)
                 del self._cameras[camera_id]
                 self._last_op = time.time()
+
+                # If this was the last camera, set back to READY for new cameras
+                if is_last_camera:
+                    logger.info(f"[CAM-MANAGER] All cameras removed - setting pipeline to READY")
+                    self.pipeline.set_state(Gst.State.READY)
+                    self.pipeline.get_state(5 * Gst.SECOND)
+                    # Reset RTSP publisher (demux pads need re-request after NULL)
+                    if self._rtsp_publisher:
+                        self._rtsp_publisher.reset()
+
+                logger.info(f"[CAM-MANAGER] Camera {camera_id} removed successfully")
                 return True
 
             except Exception as e:
-                logger.error(f"remove_camera failed: {e}")
+                logger.error(f"remove_camera failed: {e}", exc_info=True)
                 return False
 
     def add_camera_to_branch(self, camera_id: str, branch_name: str) -> bool:
@@ -533,9 +552,6 @@ class MultibranchCameraManager:
                 # This is safe because we're only adding new pads/elements
                 pad = self._link_branch(cam["bin"], cam["tee"], camera_id, cam["source_id"], branch_name, True)
                 cam["branch_pads"][branch_name] = pad
-
-                # Update batch size
-                self._update_batch_size(branch_name)
 
                 self._last_op = time.time()
                 logger.info(f"[CAM-MANAGER] Successfully added {camera_id} to branch {branch_name}")

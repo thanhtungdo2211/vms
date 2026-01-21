@@ -103,6 +103,23 @@ class DemuxRtspPublisher:
                 else:
                     logger.warning(f"[DemuxRTSP] Failed to pre-request {branch_name}/{pad_name}")
 
+    def reset(self):
+        """Reset demux publisher state after pipeline NULL.
+
+        Call this after pipeline goes to NULL state to clear cached demux
+        elements and re-request pads when pipeline returns to READY.
+        """
+        with self._lock:
+            logger.info("[DemuxRTSP] Resetting demux publisher state")
+            # Clear all publishers (they're invalid after NULL)
+            self._publishers.clear()
+            # Clear demux cache (element references may be stale)
+            self._demux_cache.clear()
+            # Clear pending links
+            self._pending_links.clear()
+            # Re-request pads now that pipeline is in NULL/READY
+            self._setup_demux_handlers()
+
     def _on_demux_pad_added(self, element, pad, branch_name):
         """Handle demux pad-added signal."""
         pad_name = pad.get_name()

@@ -27,7 +27,7 @@ RTSP_SERVER = "rtsp://192.168.6.14:8554"
 CAMERA_URI = "rtsp://192.168.6.14:8554/testface"
 MAX_CAMERAS = 3  # Maximum cameras to test
 RTSP_CAMS = 2  # Number of cameras to test RTSP (subset of MAX_CAMERAS)
-RTSP_STABILIZE = 8  # Wait for RTSP streams to stabilize before verification
+RTSP_STABILIZE = 2  # Wait for RTSP streams to stabilize before verification
 
 
 def api(method: str, endpoint: str, data: dict = None) -> dict:
