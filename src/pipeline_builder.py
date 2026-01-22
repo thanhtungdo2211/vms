@@ -21,7 +21,7 @@ from gi.repository import Gst
 if "/opt/nvidia/deepstream/deepstream/lib" not in sys.path:
     sys.path.append("/opt/nvidia/deepstream/deepstream/lib")
 
-from src.common import load_config, make_element
+from src.common import load_config, make_element, get_nvvidconv_props
 from src.probe_registry import ProbeRegistry
 from src.processor_registry import BranchProcessor, ProcessorRegistry
 from src.sinks.base_sink import BaseSink
@@ -242,6 +242,11 @@ class PipelineBuilder:
         # Handle caps specially
         if "caps" in cfg:
             props = {**props, "caps": Gst.Caps.from_string(cfg["caps"])}
+
+        # Apply platform-specific properties for nvvideoconvert
+        if elem_type == "nvvideoconvert":
+            platform_props = get_nvvidconv_props()
+            props = {**platform_props, **props}
 
         elem = make_element(elem_type, name, props)
 
