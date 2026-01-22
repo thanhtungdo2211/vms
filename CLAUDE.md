@@ -72,8 +72,13 @@ Base URL: `http://localhost:8083`
 | GET | `/api/branches` | List branches |
 | POST | `/api/cameras` | Add camera |
 | DELETE | `/api/cameras/{id}` | Remove camera |
-| POST | `/api/cameras/{id}/branches/{branch}` | Add camera to branch |
-| DELETE | `/api/cameras/{id}/branches/{branch}` | Remove camera from branch |
+| POST | `/api/cameras/{id}/branches/{branch}` | Add to branch |
+| DELETE | `/api/cameras/{id}/branches/{branch}` | Remove from branch |
+| POST | `/api/cameras/{id}/branches/{branch}/stream/start` | Start stream |
+| POST | `/api/cameras/{id}/branches/{branch}/stream/stop` | Stop stream |
+| GET | `/api/cameras/{id}/branches/{branch}/stream` | Stream status |
+| GET | `/api/streams` | All streams status |
+| GET | `/api/operations/{op_id}` | Operation status |
 | POST | `/api/pipeline/kill` | Remove all cameras |
 | POST | `/api/pipeline/stop` | Stop pipeline |
 
@@ -90,13 +95,23 @@ curl -X POST http://localhost:8083/api/cameras \
 
 # List cameras
 curl http://localhost:8083/api/cameras | python3 -m json.tool
+
+# Start stream
+curl -X POST http://localhost:8083/api/cameras/cam1/branches/detection/stream/start \
+  -H "Content-Type: application/json" \
+  -d '{"uri": "srt://192.168.6.14:8890?streamid=publish:cam1_detection", "bitrate": 4000000}'
+
+# Stop stream
+curl -X POST http://localhost:8083/api/cameras/cam1/branches/detection/stream/stop
+
+# List all streams
+curl http://localhost:8083/api/streams
 ```
 
 ## Project Structure
 
 ```
 /app/
-├── api/              # REST API server
 ├── apps/             # Processor apps (detection, face)
 │   ├── detection/    # Detection processor
 │   └── face/         # Face recognition processor
@@ -104,10 +119,13 @@ curl http://localhost:8083/api/cameras | python3 -m json.tool
 ├── data/             # Data files, output videos
 ├── entry/            # Entry points
 ├── scripts/          # Docker management scripts
-└── src/              # Core pipeline modules
-    ├── camera_manager.py
-    ├── common.py
-    └── pipeline_builder.py
+├── src/              # Core pipeline modules
+│   ├── api/          # REST API server
+│   ├── camera_manager.py
+│   ├── common.py
+│   ├── pipeline_builder.py
+│   └── stream_publisher.py
+└── tests/            # Test scripts
 ```
 
 ## Debugging Tips

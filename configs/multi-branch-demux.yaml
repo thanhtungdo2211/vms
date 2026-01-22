@@ -1,9 +1,0 @@
-camera_api:
-  host: "${API_HOST:0.0.0.0}"
-  port: "${API_PORT:8083}"
-
-pipeline:
-  name: multi-branch-demux-pipeline
-  branches:
-    recognition: apps/face/config-demux.yaml
-    detection: apps/detection/config-demux.yaml

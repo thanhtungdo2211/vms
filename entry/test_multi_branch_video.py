@@ -1,18 +1,7 @@
-#!/usr/bin/env python3
-"""
-Multi-Branch Pipeline - Clean Architecture with Auto-Discovery
-
-Usage:
-    python entry/test_multi_branch_video.py
-    python entry/test_multi_branch_video.py --config configs/multi-branch.yaml
-"""
-
 import argparse
-import faulthandler
 import logging
 import sys
 
-faulthandler.enable()
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',

@@ -17,12 +17,9 @@ muxer:
 elements:
   - type: queue
   - type: nvvideoconvert
-    name: pre_infer_conv
   - type: capsfilter
-    name: rgba_caps
     caps: "video/x-raw(memory:NVMM), format=RGBA"
   - type: nvinfer
-    name: pgie
     config_file: "data/face/models/scrfd640/infer.txt"
   - type: nvstreamdemux
     name: demux

@@ -1,12 +1,4 @@
-"""
-Common utilities for DeepStream pipeline.
-
-This module consolidates:
-- Platform detection (T4/Jetson)
-- Config loading with environment variable expansion
-- DeepStream metadata extractors
-- FPS monitoring and interval utilities
-"""
+"""Common utilities for DeepStream pipeline."""
 
 import ctypes
 import os
@@ -24,7 +16,6 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 
-# Global lock for GStreamer element operations (thread safety)
 _gst_lock = threading.Lock()
 
 
@@ -34,92 +25,47 @@ _gst_lock = threading.Lock()
 
 @dataclass
 class PlatformInfo:
-    """Platform-specific configuration for DeepStream."""
+    """Platform config: Jetson vs dGPU."""
     is_jetson: bool
     name: str
-    # Memory types: 0=DEFAULT, 1=CUDA_PINNED, 2=CUDA_DEVICE, 3=CUDA_UNIFIED, 4=SURFACE_ARRAY
-    nvbuf_memory_type: int
-    # Hardware encoder available
-    hw_encoder: str  # "nvv4l2h264enc" for Jetson, "" for dGPU (use x264enc)
-    # Compute hardware for nvvideoconvert
-    compute_hw: int  # 0=CPU, 1=GPU, 2=VIC (Jetson only)
+    nvbuf_memory_type: int  # 0=DEFAULT, 3=CUDA_UNIFIED
+    hw_encoder: str         # "nvv4l2h264enc" or ""
+    compute_hw: int         # 1=GPU, 2=VIC
 
 
 @lru_cache(maxsize=1)
 def detect_platform() -> PlatformInfo:
-    """Detect running platform (Jetson vs dGPU).
-
-    Returns PlatformInfo with optimal settings for the platform.
-    """
+    """Detect Jetson vs dGPU, return optimal settings."""
     is_jetson = os.path.exists("/etc/nv_tegra_release") or os.path.exists("/proc/device-tree/model")
-
     if is_jetson:
-        # Jetson: Use NVBUF_MEM_DEFAULT (0), VIC for compute, hardware encoder
-        return PlatformInfo(
-            is_jetson=True,
-            name="jetson",
-            nvbuf_memory_type=0,  # DEFAULT - let system decide
-            hw_encoder="nvv4l2h264enc",
-            compute_hw=2  # VIC - Video Image Compositor
-        )
-    else:
-        # dGPU (T4, etc): Use NVBUF_MEM_CUDA_UNIFIED (3), GPU compute
-        return PlatformInfo(
-            is_jetson=False,
-            name="dgpu",
-            nvbuf_memory_type=3,  # CUDA_UNIFIED
-            hw_encoder="",  # Use x264enc, nvenc not always available
-            compute_hw=1  # GPU
-        )
+        return PlatformInfo(True, "jetson", 0, "nvv4l2h264enc", 2)
+    return PlatformInfo(False, "dgpu", 3, "", 1)
 
 
 def get_encoder_element(prefix: str, bitrate: int) -> Tuple[str, str, dict]:
-    """Get optimal encoder for platform with automatic fallback.
-
-    Returns: (factory_name, element_name, properties)
-    Tries hardware encoder first, falls back to x264enc if unavailable.
-    """
+    """Get encoder (factory, name, props). Hardware first, fallback x264enc."""
     platform = detect_platform()
 
-    # Try hardware encoder on Jetson
-    if platform.hw_encoder:
-        # Check if hardware encoder is available
-        factory = Gst.ElementFactory.find(platform.hw_encoder)
-        if factory:
-            return (
-                platform.hw_encoder,
-                f"{prefix}_enc",
-                {
-                    "bitrate": bitrate,
-                    "preset-level": 1,  # UltraFast
-                    "iframeinterval": 30,
-                    "control-rate": 1,  # CBR
-                    "maxperf-enable": True
-                }
-            )
+    if platform.hw_encoder and Gst.ElementFactory.find(platform.hw_encoder):
+        return (
+            platform.hw_encoder,
+            f"{prefix}_enc",
+            {"bitrate": bitrate, "preset-level": 1, "iframeinterval": 30,
+             "control-rate": 1, "maxperf-enable": True}
+        )
 
-    # Fallback: x264enc (software)
     return (
         "x264enc",
         f"{prefix}_enc",
-        {
-            "bitrate": bitrate // 1000,  # x264 uses kbps
-            "speed-preset": "ultrafast",
-            "tune": "zerolatency",
-            "threads": 4,
-            "bframes": 0,
-            "key-int-max": 30
-        }
+        {"bitrate": bitrate // 1000, "speed-preset": "ultrafast",
+         "tune": "zerolatency", "threads": 4, "bframes": 0, "key-int-max": 30}
     )
 
 
 def get_nvvidconv_props() -> dict:
     """Get platform-optimal nvvideoconvert properties."""
-    platform = detect_platform()
-    return {
-        "compute-hw": platform.compute_hw,
-        "nvbuf-memory-type": platform.nvbuf_memory_type
-    }
+    p = detect_platform()
+    return {"compute-hw": p.compute_hw, "nvbuf-memory-type": p.nvbuf_memory_type}
 
 
 # =============================================================================
@@ -127,15 +73,11 @@ def get_nvvidconv_props() -> dict:
 # =============================================================================
 
 def load_config(path: str) -> dict:
-    """Load YAML with ${VAR:default} expansion"""
+    """Load YAML with ${VAR:default} expansion."""
     with open(path) as f:
         text = f.read()
-
-    # Expand ${VAR:default} before parsing
-    def replace(m):
-        return os.environ.get(m.group(1), m.group(2) or "")
-
-    expanded = re.sub(r'\$\{(\w+):?([^}]*)\}', replace, text)
+    expanded = re.sub(r'\$\{(\w+):?([^}]*)\}',
+                      lambda m: os.environ.get(m.group(1), m.group(2) or ""), text)
     return yaml.safe_load(expanded)
 
 
@@ -144,25 +86,7 @@ def load_config(path: str) -> dict:
 # =============================================================================
 
 def make_element(factory: str, name: str, props: dict = None) -> Gst.Element:
-    """Create GStreamer element with properties (thread-safe).
-
-    Args:
-        factory: Element factory name (e.g., "queue", "nvvideoconvert")
-        name: Element instance name
-        props: Properties dict. Keys can use "-" (auto-converted to "_")
-
-    Returns:
-        Configured Gst.Element
-
-    Raises:
-        RuntimeError: If element creation fails
-
-    Example:
-        queue = make_element("queue", "my_queue", {
-            "max-size-buffers": 30,
-            "leaky": 2
-        })
-    """
+    """Create GStreamer element with properties (thread-safe)."""
     with _gst_lock:
         elem = Gst.ElementFactory.make(factory, name)
         if not elem:
@@ -173,79 +97,47 @@ def make_element(factory: str, name: str, props: dict = None) -> Gst.Element:
 
 
 # =============================================================================
-# DeepStream Metadata Extractors
+# DeepStream Metadata
 # =============================================================================
 
 def _get_pyds():
-    """Lazy import pyds module"""
     import pyds
     return pyds
 
 
 class BatchIterator:
-    """
-    Simple iterator for DeepStream batch metadata.
-    
-    Examples:
-        # Iterate all objects
-        for frame, obj in BatchIterator(batch):
-            source_id = frame.source_id
-            object_id = obj.object_id
-            
-        # Iterate frames only
-        for frame in BatchIterator(batch).frames():
-            print(f"Frame {frame.frame_num} from source {frame.source_id}")
-            
-        # Nested iteration
-        it = BatchIterator(batch)
-        for frame in it.frames():
-            for obj in it.objects(frame):
-                process(obj)
-    """
-    
+    """Iterator for DeepStream batch metadata."""
+
     def __init__(self, batch):
         self.batch = batch
-    
+        self._pyds = _get_pyds()
+
     def __iter__(self) -> Iterator[Tuple]:
-        """Iterate all (frame_meta, obj_meta) pairs"""
         for frame in self.frames():
             for obj in self.objects(frame):
                 yield frame, obj
-    
+
     def frames(self) -> Iterator:
-        """Iterate frame metas only"""
-        pyds = _get_pyds()
         l_frame = self.batch.frame_meta_list
         while l_frame:
             try:
-                yield pyds.NvDsFrameMeta.cast(l_frame.data)
+                yield self._pyds.NvDsFrameMeta.cast(l_frame.data)
                 l_frame = l_frame.next
             except StopIteration:
                 break
-    
+
     def objects(self, frame_meta) -> Iterator:
-        """Iterate object metas in a frame"""
-        pyds = _get_pyds()
         l_obj = frame_meta.obj_meta_list
         while l_obj:
             try:
-                yield pyds.NvDsObjectMeta.cast(l_obj.data)
+                yield self._pyds.NvDsObjectMeta.cast(l_obj.data)
                 l_obj = l_obj.next
             except StopIteration:
                 break
 
 
 def extract_embedding(obj_meta, dim: int = 512) -> Optional[np.ndarray]:
-    """
-    Extract L2-normalized embedding from SGIE tensor output.
-    
-    Args:
-        obj_meta: NvDsObjectMeta with tensor output
-        dim: Embedding dimension (default: 512)
-        
-    Returns:
-        Normalized numpy array or None if no tensor found
-    """
+    """Extract L2-normalized embedding from SGIE tensor output."""
     pyds = _get_pyds()
     l_user = obj_meta.obj_user_meta_list
     while l_user:
@@ -266,19 +158,10 @@ def extract_embedding(obj_meta, dim: int = 512) -> Optional[np.ndarray]:
 
 
 def get_batch_meta(buffer):
-    """
-    Get NvDsBatchMeta from GStreamer buffer.
-    
-    Args:
-        buffer: GstBuffer from probe info
-        
-    Returns:
-        NvDsBatchMeta or None
-    """
+    """Get NvDsBatchMeta from GstBuffer."""
     if not buffer:
         return None
-    pyds = _get_pyds()
-    return pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
+    return _get_pyds().gst_buffer_get_nvds_batch_meta(hash(buffer))
 
 
 # =============================================================================
@@ -286,158 +169,96 @@ def get_batch_meta(buffer):
 # =============================================================================
 
 class FPSMonitor:
-    """
-    Reusable FPS monitor with stats callback support.
-    
-    Usage:
-        fps = FPSMonitor(name="Detection", log_interval=1.0, stats_interval=10.0)
-        fps.on_frame()
-        if fps.should_log():
-            fps.log()
-        if fps.should_stats():
-            fps.log_stats()
-    """
-    
-    def __init__(
-        self,
-        name: str,
-        log_interval: float = 1.0,
-        stats_interval: float = 10.0,
-        stats_callback: Optional[Callable[[], dict]] = None,
-    ):
+    """FPS monitor with stats callback support."""
+
+    def __init__(self, name: str, log_interval: float = 1.0,
+                 stats_interval: float = 10.0, stats_callback: Optional[Callable[[], dict]] = None):
         self._name = name
         self._log_interval = log_interval
         self._stats_interval = stats_interval
         self._stats_callback = stats_callback
-        
         self._fps_count = 0
         self._fps_start = time.time()
         self._stats_last = time.time()
-    
+
     def on_frame(self) -> None:
-        """Call this once per frame to count"""
         self._fps_count += 1
-    
+
     def should_log(self) -> bool:
-        """Check if it's time to log FPS"""
         return time.time() - self._fps_start >= self._log_interval
-    
+
     def should_stats(self) -> bool:
-        """Check if it's time to log stats"""
         return time.time() - self._stats_last >= self._stats_interval
-    
+
     def log(self) -> float:
-        """Log FPS and reset counter. Returns calculated FPS."""
         elapsed = time.time() - self._fps_start
         fps = self._fps_count / elapsed if elapsed > 0 else 0
         print(f"[{self._name} FPS] {fps:.1f}")
         self._fps_start = time.time()
         self._fps_count = 0
         return fps
-    
+
     def log_stats(self) -> Optional[dict]:
-        """Log stats using callback. Returns stats dict or None."""
         if self._stats_callback:
             stats = self._stats_callback()
             print(f"[{self._name} STATS] " + ", ".join(f"{k}={v}" for k, v in stats.items()))
             self._stats_last = time.time()
             return stats
         return None
-    
+
     def reset(self) -> None:
-        """Reset all counters"""
         self._fps_count = 0
         self._fps_start = time.time()
         self._stats_last = time.time()
-    
+
     @property
     def current_fps(self) -> float:
-        """Get current instantaneous FPS"""
         elapsed = time.time() - self._fps_start
         return self._fps_count / elapsed if elapsed > 0 else 0
 
 
-def fps_probe_factory(
-    name: str,
-    log_interval: float = 1.0,
-    stats_interval: float = 10.0,
-    stats_callback: Optional[Callable[[], dict]] = None,
-) -> Callable:
-    """
-    Create a standard FPS probe callback.
-    
-    Args:
-        name: Processor name for logging
-        log_interval: Seconds between FPS logs
-        stats_interval: Seconds between stats logs
-        stats_callback: Callback to get stats dict
-    
-    Returns:
-        Probe callback function
-    """
+def fps_probe_factory(name: str, log_interval: float = 1.0, stats_interval: float = 10.0,
+                      stats_callback: Optional[Callable[[], dict]] = None) -> Callable:
+    """Create FPS probe callback."""
     monitor = FPSMonitor(name, log_interval, stats_interval, stats_callback)
-    call_count = [0]
-    
+
     def fps_probe(pad, info, user_data) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
-        if not buffer:
+        if not buffer or not get_batch_meta(buffer):
             return Gst.PadProbeReturn.OK
-        
-        batch = get_batch_meta(buffer)
-        if not batch:
-            return Gst.PadProbeReturn.OK
-        
-        call_count[0] += 1
-        if call_count[0] <= 3:
-            print(f"[DEBUG] {name} probe called, batch={batch is not None}, count={call_count[0]}")
-        
         monitor.on_frame()
-        
         if monitor.should_log():
             monitor.log()
-        
         if monitor.should_stats():
             monitor.log_stats()
-        
         return Gst.PadProbeReturn.OK
-    
-    print(f"[fps_probe_factory] Created probe for '{name}'")
+
     return fps_probe
 
 
 class IntervalRunner:
-    """
-    Run callback at fixed interval using GLib timeout.
-    
-    Usage:
-        runner = IntervalRunner(interval_ms=10000, callback=cleanup_func)
-        runner.start()
-        runner.stop()
-    """
-    
+    """Run callback at fixed interval using GLib timeout."""
+
     def __init__(self, interval_ms: int, callback: Callable[[int], None]):
         self._interval_ms = interval_ms
         self._callback = callback
         self._source_id: Optional[int] = None
-        self._frame_count = 0
-    
+        self._count = 0
+
     def start(self) -> None:
-        """Start the interval timer"""
         if self._source_id is None:
             self._source_id = GLib.timeout_add(self._interval_ms, self._run)
-    
+
     def stop(self) -> None:
-        """Stop the interval timer"""
         if self._source_id is not None:
             GLib.source_remove(self._source_id)
             self._source_id = None
-    
+
     def _run(self) -> bool:
-        """Called by GLib timer"""
-        self._frame_count += 1
-        self._callback(self._frame_count)
+        self._count += 1
+        self._callback(self._count)
         return True
-    
+
     @property
     def is_running(self) -> bool:
         return self._source_id is not None
