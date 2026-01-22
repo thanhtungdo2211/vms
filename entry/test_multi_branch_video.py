@@ -2,11 +2,6 @@
 """
 Multi-Branch Pipeline - Clean Architecture with Auto-Discovery
 
-STABILITY FIX (2026-01-13):
-- Pipeline starts in READY state, not PLAYING
-- Only transitions to PLAYING after first camera is added
-- This prevents nvstreammux crash with empty sources
-
 Usage:
     python entry/test_multi_branch_video.py
     python entry/test_multi_branch_video.py --config configs/multi-branch.yaml
@@ -17,28 +12,15 @@ import faulthandler
 import logging
 import sys
 
-# Enable faulthandler to print Python traceback on segfault
 faulthandler.enable()
-
-# Configure logging early
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S'
 )
 
-import gi
-gi.require_version("Gst", "1.0")
-from gi.repository import Gst
-
-# Import directly from modules (no __init__.py)
 from src.pipeline_builder import PipelineBuilder
-from src.camera_manager import MultibranchCameraManager
-from src.demux_rtsp_publisher import DemuxRtspPublisher
-from src.warmup_manager import WarmupManager
 from src.common import load_config
-from api.camera_api import CameraAPIServer
-from api.shutdown import setup_signal_handlers, wait_for_shutdown
 
 
 def main():
@@ -46,91 +28,17 @@ def main():
     print("Multi-Branch Pipeline with Auto-Discovery")
     print("=" * 60)
 
-    parser = argparse.ArgumentParser(
-        description="Run multi-branch DeepStream pipeline with auto-discovered processors"
-    )
-    parser.add_argument(
-        "--config",
-        default="configs/multi-branch.yaml",
-        help="Path to pipeline configuration YAML"
-    )
+    parser = argparse.ArgumentParser(description="Run multi-branch DeepStream pipeline")
+    parser.add_argument("--config", default="configs/multi-branch.yaml", help="Config path")
     args = parser.parse_args()
 
-    # Load configuration
     config = load_config(args.config)
     print(f"[Config] Loaded: {args.config}")
 
     builder = PipelineBuilder(config)
-
-    # Build pipeline
-    pipeline = builder.build()
-
-    # Create camera manager for dynamic camera control
-    manager = MultibranchCameraManager(pipeline, builder.branches)
-
-    # Setup signal handlers for graceful shutdown
-    setup_signal_handlers()
-
-    # Start sinks
-    for sink in builder.branch_sinks.values():
-        sink.start()
-
-    # Create per-camera RTSP publisher using demux (annotated streams)
-    # NOTE: MUST be created BEFORE pipeline transitions to READY
-    # nvstreamdemux requires pads to be pre-requested in NULL state
-    per_camera_rtsp = DemuxRtspPublisher(pipeline, builder.branches, manager)
-    print("[RTSP] Using DemuxRtspPublisher (annotated per-camera streams)")
-
-    # STABILITY FIX: Start in READY state, not PLAYING
-    # This prevents crashes from empty nvstreammux
-    # Pipeline will transition to PLAYING when first camera is added
-    print("\n[Pipeline] Setting to READY (will PLAY after first camera added)...")
-    ret = pipeline.set_state(Gst.State.READY)
-    if ret == Gst.StateChangeReturn.FAILURE:
-        print("[ERROR] Failed to set pipeline to READY!")
-        return 1
-
-    # Wait for READY state
-    ret, _, _ = pipeline.get_state(5 * Gst.SECOND)
-    if ret == Gst.StateChangeReturn.FAILURE:
-        print("[ERROR] Pipeline failed to reach READY state!")
-        return 1
-
-    print("[Pipeline] READY - waiting for cameras...")
-
-    # Warmup: Pre-load TensorRT engines before first camera
-    warmup_config = config.get("warmup", {})
-    if warmup_config.get("enabled", True):
-        print("\n[Warmup] Pre-loading inference engines...")
-        warmup = WarmupManager(pipeline, builder.branches)
-        timeout = warmup_config.get("timeout", 15.0)
-        num_frames = warmup_config.get("num_frames", 64)
-        if warmup.warmup(timeout=timeout, num_frames=num_frames):
-            print("[Warmup] Complete - engines ready")
-        else:
-            print("[Warmup] Warning: warmup failed, first camera may have latency")
-
-    # Start processors after pipeline is ready
-    builder.start_processors()
-
-    # Start camera API server with RTSP publishers
-    api = CameraAPIServer(
-        config.get("camera_api", {}),
-        manager,
-        demux_rtsp_publisher=per_camera_rtsp
-    )
-    api.start()
-
-    # Wait for shutdown signal
-    wait_for_shutdown()
-
-    # Graceful shutdown sequence
-    print("\n[Shutdown] Stopping...")
-    api.stop()
-    builder.stop_processors()
-    pipeline.set_state(Gst.State.NULL)
-    for sink in builder.branch_sinks.values():
-        sink.stop()
+    builder.build()
+    builder.start_api()
+    builder.wait_and_shutdown()
 
     print("[Done]")
     return 0

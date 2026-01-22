@@ -23,6 +23,18 @@ from src.sinks.base_sink import BaseSink
 from src.probe_registry import ProbeRegistry
 from src.common import load_config
 from src.processor_registry import ProcessorRegistry, BranchProcessor
+import signal
+import threading
+
+stop_event = threading.Event()
+def setup_signal_handlers():
+    """Setup SIGINT/SIGTERM handlers"""
+    def on_shutdown(signum, frame):
+        print(f"\n[Shutdown] Signal {signum} received...")
+        stop_event.set()
+    
+    signal.signal(signal.SIGINT, on_shutdown)
+    signal.signal(signal.SIGTERM, on_shutdown)
 
 
 @dataclass
@@ -45,6 +57,11 @@ class PipelineBuilder:
         self.pipeline: Optional[Gst.Pipeline] = None
         self.branches: dict[str, BranchInfo] = {}
         self.processors: dict[str, BranchProcessor] = {}
+
+        # Runtime components (created during start_api)
+        self._camera_manager = None
+        self._rtsp_publisher = None
+        self._api_server = None
 
         if processors:
             for p in processors:
@@ -84,8 +101,17 @@ class PipelineBuilder:
         return sinks
 
     def build(self) -> Gst.Pipeline:
-        """Build pipeline from config."""
+        """Build pipeline from config and initialize to READY state.
+
+        Handles:
+        - Signal handlers setup for graceful shutdown
+        - Starting sinks
+        - Setting pipeline to READY state
+        - Running warmup to pre-load TensorRT engines
+        """
         Gst.init(None)
+        setup_signal_handlers()
+
         self.pipeline = Gst.Pipeline.new(self.config.get("pipeline", {}).get("name", "pipeline"))
 
         branches_cfg = self.config.get("pipeline", {}).get("branches", {})
@@ -112,7 +138,49 @@ class PipelineBuilder:
 
         self.pipeline.get_bus().add_signal_watch()
         logger.info(f"Pipeline built: {len(self.branches)} branches")
+
+        # Start sinks
+        for sink in self.branch_sinks.values():
+            sink.start()
+
         return self.pipeline
+
+    def set_ready_and_warmup(self) -> bool:
+        """Set pipeline to READY state and run warmup.
+
+        Returns True if successful, False on failure.
+        Call this AFTER creating RTSP publishers (they need NULL state pads).
+        """
+        from src.warmup_manager import WarmupManager
+
+        # Set to READY state (prevents nvstreammux crash with empty sources)
+        logger.info("Setting pipeline to READY (will PLAY after first camera added)...")
+        ret = self.pipeline.set_state(Gst.State.READY)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            logger.error("Failed to set pipeline to READY!")
+            return False
+
+        # Wait for READY state
+        ret, _, _ = self.pipeline.get_state(5 * Gst.SECOND)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            logger.error("Pipeline failed to reach READY state!")
+            return False
+
+        logger.info("Pipeline READY - waiting for cameras...")
+
+        # Warmup: Pre-load TensorRT engines
+        warmup_config = self.config.get("warmup", {})
+        if warmup_config.get("enabled", True):
+            logger.info("Pre-loading inference engines...")
+            warmup = WarmupManager(self.pipeline, self.branches)
+            timeout = warmup_config.get("timeout", 15.0)
+            num_frames = warmup_config.get("num_frames", 64)
+            if warmup.warmup(timeout=timeout, num_frames=num_frames):
+                logger.info("Warmup complete - engines ready")
+            else:
+                logger.warning("Warmup failed, first camera may have latency")
+
+        return True
 
     def _build_branch(self, name: str, cfg) -> None:
         """Build single branch: mux -> elements -> sink."""
@@ -267,6 +335,81 @@ class PipelineBuilder:
     def stop_processors(self) -> None:
         for p in self.processors.values():
             p.on_stop()
+
+    def start_api(self) -> None:
+        """Create and start camera manager, RTSP publisher, and API server.
+
+        Must be called AFTER build() but BEFORE set_ready_and_warmup().
+        Creates:
+        - MultibranchCameraManager for dynamic camera control
+        - DemuxRtspPublisher for per-camera RTSP streams
+        - CameraAPIServer for REST API
+        """
+        from src.camera_manager import MultibranchCameraManager
+        from src.demux_rtsp_publisher import DemuxRtspPublisher
+        from src.api.camera_api import CameraAPIServer
+
+        # Create camera manager
+        self._camera_manager = MultibranchCameraManager(self.pipeline, self.branches)
+
+        # Create RTSP publisher (MUST be before READY state - needs NULL state pads)
+        self._rtsp_publisher = DemuxRtspPublisher(
+            self.pipeline, self.branches, self._camera_manager
+        )
+        logger.info("RTSP publisher created (per-camera annotated streams)")
+
+        # Set READY and warmup
+        if not self.set_ready_and_warmup():
+            raise RuntimeError("Failed to set pipeline READY state")
+
+        # Start processors
+        self.start_processors()
+
+        # Start API server
+        self._api_server = CameraAPIServer(
+            self.config.get("camera_api", {}),
+            self._camera_manager,
+            demux_rtsp_publisher=self._rtsp_publisher
+        )
+        self._api_server.start()
+
+    def shutdown(self) -> None:
+        """Graceful shutdown sequence."""
+        logger.info("Shutting down...")
+
+        if self._api_server:
+            self._api_server.stop()
+
+        self.stop_processors()
+
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+
+        for sink in self.branch_sinks.values():
+            sink.stop()
+
+        logger.info("Shutdown complete")
+
+    def wait_and_shutdown(self) -> None:
+        """Block until shutdown signal, then perform graceful shutdown."""
+        while not stop_event.is_set():
+            threading.Event().wait(1)
+        self.shutdown()
+
+    @property
+    def camera_manager(self):
+        """Access camera manager (available after start_api)."""
+        return self._camera_manager
+
+    @property
+    def rtsp_publisher(self):
+        """Access RTSP publisher (available after start_api)."""
+        return self._rtsp_publisher
+
+    @property
+    def api_server(self):
+        """Access API server (available after start_api)."""
+        return self._api_server
 
     def run(self) -> None:
         """Run pipeline with GLib main loop."""

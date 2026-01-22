@@ -20,7 +20,6 @@ Endpoints:
 
 import logging
 import queue
-import threading
 import time
 from typing import TYPE_CHECKING, List, Optional
 
@@ -29,10 +28,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-from api.shutdown import stop_event
+import signal
+import threading
+
+stop_event = threading.Event()
+def setup_signal_handlers():
+    """Setup SIGINT/SIGTERM handlers"""
+    def on_shutdown(signum, frame):
+        print(f"\n[Shutdown] Signal {signum} received...")
+        stop_event.set()
+    
+    signal.signal(signal.SIGINT, on_shutdown)
+    signal.signal(signal.SIGTERM, on_shutdown)
 
 logger = logging.getLogger(__name__)
-
 
 class CameraAPIServer:
     # Operation delays for pipeline stabilization
