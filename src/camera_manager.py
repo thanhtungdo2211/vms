@@ -1,12 +1,3 @@
-"""Dynamic camera management with tee fanout to multiple branches.
-
-STABILITY FIX (2026-01-13):
-- PAUSE pipeline during camera add/remove for safe topology changes
-- Incremental state sync: NULL → READY → PAUSED → PLAYING with waits
-- Update batch size AFTER state sync completes
-- Reference: /home/mq/disk2T/duy/tks_prj/infra/deepstream
-"""
-
 from __future__ import annotations
 
 import logging
@@ -256,10 +247,18 @@ class MultibranchCameraManager:
                 # STEP 4: Now sync camera bin state (with branches already linked)
                 logger.info(f"[CAM-MANAGER] Syncing camera bin to pipeline state")
 
-                if is_first_camera or prev_state == Gst.State.READY:
-                    # First camera - sync to READY, then transition with pipeline
+                if prev_state == Gst.State.READY:
+                    # Pipeline in READY - sync camera bin to READY, then transition with pipeline
                     if not self._incremental_state_sync(bin_elem, Gst.State.READY):
                         logger.error(f"[CAM-MANAGER] Failed to sync camera bin to READY")
+                elif prev_state == Gst.State.PAUSED:
+                    # Pipeline already PAUSED (warmup done or after all cameras removed)
+                    # TensorRT engines already loaded, sync bin to PAUSED
+                    logger.info(f"[CAM-MANAGER] Pipeline PAUSED - syncing camera bin to PAUSED")
+                    if not self._incremental_state_sync(bin_elem, Gst.State.PAUSED):
+                        logger.warning(f"[CAM-MANAGER] Camera bin PAUSED sync warning")
+                    if not is_file:
+                        time.sleep(1.0)  # Wait for decoder to initialize
                 elif prev_state == Gst.State.PLAYING:
                     # Additional camera - pipeline was paused in STEP 1
                     # Sync bin to PAUSED state (matching current pipeline state)
@@ -284,9 +283,9 @@ class MultibranchCameraManager:
                 }
 
                 # STEP 6: Transition pipeline and camera to PLAYING
-                if is_first_camera or prev_state == Gst.State.READY:
-                    # First camera - need to start entire pipeline
-                    logger.info(f"[CAM-MANAGER] First camera - transitioning pipeline to PLAYING")
+                if prev_state == Gst.State.READY:
+                    # Pipeline was in READY - need to load engines first
+                    logger.info(f"[CAM-MANAGER] Pipeline READY - transitioning to PLAYING")
 
                     # Set pipeline to PAUSED first (load all elements including branches)
                     logger.info(f"[CAM-MANAGER] Setting pipeline to PAUSED for safe preroll")
@@ -304,6 +303,24 @@ class MultibranchCameraManager:
                     ret, _, _ = self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
                     if ret == Gst.StateChangeReturn.FAILURE:
                         logger.warning(f"[CAM-MANAGER] Pipeline PLAYING transition returned FAILURE (may still work)")
+
+                elif prev_state == Gst.State.PAUSED:
+                    # Pipeline already PAUSED (TensorRT engines loaded) - just go to PLAYING
+                    logger.info(f"[CAM-MANAGER] Pipeline PAUSED - transitioning to PLAYING")
+
+                    # Wait for nvurisrcbin to connect and negotiate caps
+                    time.sleep(2.0)
+
+                    # Transition to PLAYING
+                    self.pipeline.set_state(Gst.State.PLAYING)
+                    ret, _, _ = self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        logger.warning(f"[CAM-MANAGER] Pipeline PLAYING transition returned FAILURE (may still work)")
+
+                    # Sync camera bin to PLAYING
+                    logger.info(f"[CAM-MANAGER] Syncing camera bin to PLAYING")
+                    if not self._incremental_state_sync(bin_elem, Gst.State.PLAYING):
+                        logger.warning(f"[CAM-MANAGER] Camera bin PLAYING sync warning")
 
                 elif prev_state == Gst.State.PLAYING:
                     # Additional camera - pipeline was PAUSED in STEP 1
@@ -365,9 +382,6 @@ class MultibranchCameraManager:
 
         Uses blocking probes to stop data flow, then drains buffers before
         destroying decoder to prevent CUDA memory corruption.
-
-        When removing the last camera, pauses pipeline first to prevent
-        nvstreammux/nvinfer CUDA errors with empty input.
         """
         with self._lock:
             self._delay()
@@ -378,75 +392,28 @@ class MultibranchCameraManager:
             try:
                 logger.info(f"[CAM-MANAGER] Removing camera {camera_id}...")
 
-                # Check if this is the last camera - need special handling
-                is_last_camera = len(self._cameras) == 1
-                prev_state = Gst.State.NULL
-
-                if is_last_camera:
-                    # For last camera, set pipeline to NULL BEFORE removing
-                    # This forces TensorRT/CUDA cleanup while camera is still linked
-                    # preventing race conditions with buffer cleanup
-                    _, prev_state, _ = self.pipeline.get_state(0)
-                    logger.info(f"[CAM-MANAGER] Last camera - setting pipeline to NULL first")
-                    self.pipeline.set_state(Gst.State.NULL)
-                    self.pipeline.get_state(5 * Gst.SECOND)
-                    # Wait for GPU cleanup to complete
-                    time.sleep(0.5)
-
-                # Step 1: Cleanup RTSP publisher first (before removing camera resources)
+                # Cleanup RTSP publisher first (before removing camera resources)
                 if self._rtsp_publisher:
                     self._rtsp_publisher.cleanup_camera(camera_id)
 
-                # Step 2: Add blocking probes on all branch pads (BLOCK, not REMOVE)
-                # This stops new data from entering downstream while we drain
-                probe_ids = {}
-                for branch_name, pad in cam["branch_pads"].items():
-                    pid = pad.add_probe(
-                        Gst.PadProbeType.BLOCK_DOWNSTREAM,
-                        lambda *_: Gst.PadProbeReturn.OK  # Block indefinitely
-                    )
-                    probe_ids[branch_name] = (pad, pid)
-                    logger.debug(f"[CAM-MANAGER] Blocked {camera_id} on branch {branch_name}")
+                # Block data flow with probes
+                for pad in cam["branch_pads"].values():
+                    pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, lambda *_: Gst.PadProbeReturn.REMOVE)
+                time.sleep(0.2)
 
-                # Step 3: Send EOS to camera bin to flush decoder buffers
-                # EOS propagates through decoder, flushing all in-flight buffers
-                cam["bin"].send_event(Gst.Event.new_eos())
-
-                # Step 4: Wait for buffers to drain from decoder
-                # nvv4l2decoder needs time to process remaining buffers
-                time.sleep(0.8)
-
-                # Step 5: Set bin to NULL state (closes decoder FDs safely)
+                # Set camera bin to NULL
                 cam["bin"].set_state(Gst.State.NULL)
-                ret, _, _ = cam["bin"].get_state(2 * Gst.SECOND)
-                if ret != Gst.StateChangeReturn.SUCCESS:
-                    logger.warning(f"[CAM-MANAGER] Camera bin NULL state change: {ret}")
+                cam["bin"].get_state(Gst.CLOCK_TIME_NONE)
 
-                # Step 6: Remove blocking probes
-                for branch_name, (pad, pid) in probe_ids.items():
-                    try:
-                        pad.remove_probe(pid)
-                    except Exception:
-                        pass  # Pad may already be unlinked
-
-                # Step 7: Unlink from all branches
+                # Unlink from all branches
                 for b in list(cam["branch_pads"].keys()):
                     self._unlink_branch(cam, b, camera_id)
 
-                # Step 8: Remove bin from pipeline
+                # Remove bin from pipeline
                 self.pipeline.remove(cam["bin"])
                 self._mapper.remove(camera_id)
                 del self._cameras[camera_id]
                 self._last_op = time.time()
-
-                # If this was the last camera, set back to READY for new cameras
-                if is_last_camera:
-                    logger.info(f"[CAM-MANAGER] All cameras removed - setting pipeline to READY")
-                    self.pipeline.set_state(Gst.State.READY)
-                    self.pipeline.get_state(5 * Gst.SECOND)
-                    # Reset RTSP publisher (demux pads need re-request after NULL)
-                    if self._rtsp_publisher:
-                        self._rtsp_publisher.reset()
 
                 logger.info(f"[CAM-MANAGER] Camera {camera_id} removed successfully")
                 return True

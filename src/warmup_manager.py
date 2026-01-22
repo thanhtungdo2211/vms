@@ -178,11 +178,11 @@ class WarmupManager:
             return False
 
     def _link_to_branches(self) -> bool:
-        """Link dummy source tee to first branch nvstreammux only.
+        """Link dummy source tee to FIRST branch nvstreammux only (for warmup).
 
-        NOTE: We only link to ONE branch to minimize complexity and avoid
-        potential conflicts with nvstreamdemux. Loading one branch is
-        sufficient to warm up the shared TensorRT engine.
+        During warmup, we only link to ONE branch to minimize complexity.
+        After warmup (in _cleanup), we add links to remaining branches while
+        pipeline is PAUSED to prevent empty muxer state.
         """
         tee = self._warmup_bin.get_by_name(f"tee_{self.WARMUP_CAMERA_ID}")
         if not tee:
@@ -191,7 +191,7 @@ class WarmupManager:
         linked_branches = []
         self._linked_pads = []
 
-        # Only link to first branch
+        # Only link to first branch for warmup
         first_branch_name = list(self.branches.keys())[0]
         branch = self.branches[first_branch_name]
 
@@ -238,10 +238,70 @@ class WarmupManager:
             logger.error("[WARMUP] Failed to link to any branch")
             return False
 
-    def _cleanup(self) -> None:
-        """Remove dummy source and leave pipeline in PAUSED state.
+    def _link_remaining_branches(self) -> None:
+        """Link warmup source to remaining branches (call after warmup, while PAUSED).
 
-        CRITICAL: Does NOT set pipeline to NULL or READY to preserve loaded TensorRT engines.
+        This ensures ALL muxers have at least 1 source, preventing empty muxer
+        CUDA errors when real cameras are removed.
+        """
+        tee = self._warmup_bin.get_by_name(f"tee_{self.WARMUP_CAMERA_ID}")
+        if not tee:
+            return
+
+        # Get already linked branches
+        already_linked = {pad[0] for pad in self._linked_pads}
+
+        for branch_name, branch in self.branches.items():
+            if branch_name in already_linked:
+                continue
+
+            try:
+                # Create queue for this branch
+                queue = Gst.ElementFactory.make("queue", f"q_{self.WARMUP_CAMERA_ID}_{branch_name}")
+                queue.set_property("max-size-buffers", 1)  # Minimal buffering
+                queue.set_property("max-size-bytes", 0)
+                queue.set_property("max-size-time", 0)
+                queue.set_property("leaky", 2)
+                self._warmup_bin.add(queue)
+
+                # Request tee src pad and link to queue
+                tee_src = tee.request_pad_simple("src_%u")
+                if not tee_src.link(queue.get_static_pad("sink")) == Gst.PadLinkReturn.OK:
+                    logger.warning(f"[WARMUP] Failed to link tee → queue for {branch_name}")
+                    continue
+
+                # Request nvstreammux sink pad and link via ghost pad
+                mux_sink = branch.nvstreammux.request_pad_simple(f"sink_{self._source_id}")
+                if not mux_sink:
+                    logger.warning(f"[WARMUP] Failed to request mux pad for {branch_name}")
+                    continue
+
+                ghost = Gst.GhostPad.new(f"g_{branch_name}_{self.WARMUP_CAMERA_ID}", queue.get_static_pad("src"))
+                self._warmup_bin.add_pad(ghost)
+
+                # Sync queue state to pipeline
+                queue.sync_state_with_parent()
+
+                if ghost.link(mux_sink) == Gst.PadLinkReturn.OK:
+                    self._linked_pads.append((branch_name, ghost, mux_sink, tee_src))
+                    logger.info(f"[WARMUP] Added link to remaining branch: {branch_name}")
+                else:
+                    logger.warning(f"[WARMUP] Failed to link ghost → mux for {branch_name}")
+
+            except Exception as e:
+                logger.warning(f"[WARMUP] Failed to link remaining branch {branch_name}: {e}")
+
+    def _cleanup(self) -> None:
+        """Stop warmup source but KEEP it linked to muxer.
+
+        STABILITY FIX (2026-01-22): Empty nvstreammux causes CUDA memory corruption.
+        Instead of unlinking the warmup dummy from muxer, just block its data flow.
+        This keeps muxer with at least 1 source at all times, preventing crashes
+        when all real cameras are removed.
+
+        Also links warmup source to ALL remaining branches (while PAUSED) to ensure
+        every muxer has at least 1 source.
+
         Pipeline stays in PAUSED state - camera_manager will transition to PLAYING
         when first real camera is added.
         """
@@ -257,7 +317,7 @@ class WarmupManager:
                 logger.warning("[WARMUP] Pipeline PAUSED transition warning")
             time.sleep(0.3)
 
-            # Step 2: Block data flow on tee sink pad
+            # Step 2: Block data flow on tee sink pad (DROP all frames)
             tee = self._warmup_bin.get_by_name(f"tee_{self.WARMUP_CAMERA_ID}")
             if tee:
                 sink_pad = tee.get_static_pad("sink")
@@ -267,38 +327,21 @@ class WarmupManager:
                     sink_pad.add_probe(Gst.PadProbeType.BUFFER, block_probe)
             time.sleep(0.2)  # Let in-flight buffers drain
 
-            # Step 3: Unlink from nvstreammux pads (while PAUSED)
-            # NOTE: Do NOT release_request_pad - that triggers EOS which corrupts demux pads
-            # Just unlink and let the pad be orphaned - it will be cleaned up when a real camera uses it
-            for branch_name, ghost, mux_sink, tee_src in self._linked_pads:
-                try:
-                    ghost.unlink(mux_sink)
-                    # DON'T release the mux pad - causes EOS to be sent downstream
-                    # branch.nvstreammux.release_request_pad(mux_sink)
-                    self._warmup_bin.remove_pad(ghost)
-                except Exception as e:
-                    logger.debug(f"[WARMUP] Cleanup unlink warning for {branch_name}: {e}")
+            # Step 3: Link warmup source to ALL remaining branches (while PAUSED)
+            # This ensures every muxer has at least 1 source
+            self._link_remaining_branches()
 
-            # Step 4: Release tee src pads
-            if tee:
-                for _, _, _, tee_src in self._linked_pads:
-                    try:
-                        tee.release_request_pad(tee_src)
-                    except Exception:
-                        pass
+            # STABILITY FIX: DO NOT unlink from muxer pads
+            # Keep warmup source linked to muxer to prevent empty muxer state
+            # This ensures nvstreammux always has at least 1 source
+            logger.debug("[WARMUP] Keeping warmup source linked to ALL muxers (stability fix)")
 
-            self._linked_pads = []
+            # DO NOT remove warmup bin - keep it in pipeline
+            # Just set it to PAUSED to stop pushing frames
+            self._warmup_bin.set_state(Gst.State.PAUSED)
 
-            # Step 5: Set warmup bin to NULL and remove from pipeline
-            self._warmup_bin.set_state(Gst.State.NULL)
-            self._warmup_bin.get_state(STATE_CHANGE_TIMEOUT)
-            self.pipeline.remove(self._warmup_bin)
-            self._warmup_bin = None
-
-            # NOTE: Leave pipeline in PAUSED state (NOT READY)
-            # camera_manager will transition to PLAYING when first camera is added
-            # Transitioning to READY with empty nvstreammux causes CUDA memory corruption
-            logger.debug("[WARMUP] Cleanup complete - pipeline PAUSED, engines preserved")
+            linked_branch_names = [pad[0] for pad in self._linked_pads]
+            logger.info(f"[WARMUP] Cleanup complete - pipeline PAUSED, warmup linked to: {linked_branch_names}")
 
         except Exception as e:
             logger.warning(f"[WARMUP] Cleanup error: {e}")
