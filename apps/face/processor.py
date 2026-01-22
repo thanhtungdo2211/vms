@@ -317,7 +317,7 @@ class EventSet:
 class FaceRecognitionProcessor:
     """
     Face recognition processor - all-in-one implementation.
-    
+
     Combines:
     - Database loading/matching
     - Tracker management
@@ -326,37 +326,38 @@ class FaceRecognitionProcessor:
     - OSD display
     """
 
-    def __init__(self, source_mapper=None):
-        self._config: Dict[str, Any] = {}
-        self._sink: Optional[BaseSink] = None
+    def __init__(self, config: Dict[str, Any], sink: BaseSink, source_mapper=None):
+        """Initialize face recognition processor.
+
+        Args:
+            config: Branch configuration dict
+            sink: BaseSink for sending events
+            source_mapper: SourceIDMapper for camera_id <-> source_id mapping
+        """
+        self._config = config
+        self._sink = sink
         self._source_mapper = source_mapper
-        self._db: Optional[FaceDatabase] = None
-        self._trackers: Optional[TrackerManager] = None
-        self._sent_faces: Optional[EventSet] = None
-        self._cleanup_runner: Optional[IntervalRunner] = None
+        params = config.get("params", {})
+
+        # Load face database
+        features_path = params.get("features_json", "data/face/features.json")
+        print(f"[FaceRecognitionProcessor] Loading {features_path}...")
+        self._db = FaceDatabase(features_path)
+        print(f"[FaceRecognitionProcessor] Loaded {len(self._db.names)} faces")
+
+        # Initialize tracker manager and event set
+        self._trackers = TrackerManager(params)
+        self._sent_faces = EventSet(max_age=params.get("max_age", 30))
+
+        # Cleanup runner
+        cleanup_interval = params.get("cleanup_interval", 10) * 1000
+        self._cleanup_runner = IntervalRunner(cleanup_interval, self._cleanup)
+
+        print("[FaceRecognitionProcessor] Initialized")
 
     @property
     def name(self) -> str:
         return "recognition"
-
-    def setup(self, config: Dict[str, Any], sink: BaseSink) -> None:
-        """Initialize face recognition components"""
-        self._config = config
-        self._sink = sink
-        params = config.get("params", {})
-        features_path = params.get("features_json", "data/face/features.json")
-
-        print(f"[FaceRecognitionProcessor] Loading {features_path}...")
-        self._db = FaceDatabase(features_path)
-        print(f"[FaceRecognitionProcessor] Loaded {len(self._db.names)} faces")
-        
-        self._trackers = TrackerManager(params)
-        self._sent_faces = EventSet(max_age=params.get("max_age", 30))
-        
-        cleanup_interval = params.get("cleanup_interval", 10) * 1000
-        self._cleanup_runner = IntervalRunner(cleanup_interval, self._cleanup)
-        
-        print("[FaceRecognitionProcessor] Setup complete")
     
     def _get_stats(self) -> dict:
         """Return stats dict for """
@@ -367,8 +368,6 @@ class FaceRecognitionProcessor:
 
     def get_probes(self) -> Dict[str, Callable]:
         """Return probe callbacks"""
-        if not self._db:
-            raise RuntimeError("Processor not initialized. Call setup() first.")
         params = self._config.get("params", {})
         return {
             "tracker_probe": self._tracker_probe,
@@ -491,6 +490,3 @@ class FaceRecognitionProcessor:
     @property
     def database(self) -> Optional[FaceDatabase]:
         return self._db
-
-    def set_source_mapper(self, source_mapper) -> None:
-        self._source_mapper = source_mapper

@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from src.pipeline_builder import BranchInfo
     from src.camera_manager import MultibranchCameraManager
 
-from src.common import make_element, detect_platform, get_encoder_element, get_nvvidconv_props
+from src.common import make_element, detect_platform, get_encoder_element, get_nvvidconv_props, link_chain
 
 logger = logging.getLogger(__name__)
 
@@ -152,14 +152,6 @@ class StreamPublisher:
         else:
             logger.warning(f"[StreamPublisher] Failed to request pad {pad_name}")
         return pad
-
-    def _link_chain(self, elements: list) -> bool:
-        """Link element chain. Returns True on success."""
-        for i in range(len(elements) - 1):
-            src_elem, dst_elem = elements[i], elements[i + 1]
-            if not src_elem.link(dst_elem):
-                raise RuntimeError(f"Failed to link {src_elem.get_name()} -> {dst_elem.get_name()}")
-        return True
 
     def _pub_to_dict(self, pub: PublishInfo) -> dict:
         """Convert PublishInfo to status dict."""
@@ -304,7 +296,7 @@ class StreamPublisher:
                     self.pipeline.add(elem)
 
                 # Link stream chain
-                self._link_chain(elements)
+                link_chain(elements)
 
                 # Get demux pad
                 demux_src = self._get_demux_pad(demux, cam.source_id)

@@ -94,6 +94,24 @@ def make_element(factory: str, name: Optional[str], props: dict = None) -> Gst.E
         return elem
 
 
+def link_chain(chain: list, stop_at=None) -> None:
+    """Link GStreamer elements in chain sequentially.
+
+    Args:
+        chain: List of Gst.Element to link
+        stop_at: Optional element to stop linking after
+
+    Raises:
+        RuntimeError: If linking fails
+    """
+    for i in range(len(chain) - 1):
+        src, dst = chain[i], chain[i + 1]
+        if not src.link(dst):
+            raise RuntimeError(f"Failed to link {src.get_name()} -> {dst.get_name()}")
+        if stop_at and dst == stop_at:
+            break
+
+
 # =============================================================================
 # DeepStream Metadata
 # =============================================================================

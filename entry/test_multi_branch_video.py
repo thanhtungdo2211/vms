@@ -26,7 +26,6 @@ def main():
 
     builder = PipelineBuilder(config)
     builder.build()
-    builder.start_api()
     builder.wait_and_shutdown()
 
     print("[Done]")

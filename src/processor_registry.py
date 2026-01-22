@@ -13,15 +13,17 @@ from src.sinks.base_sink import BaseSink
 
 
 class BranchProcessor(ABC):
-    """Abstract base class for branch processors."""
+    """Abstract base class for branch processors.
+
+    Processors are instantiated with:
+        __init__(config: dict, sink: BaseSink, source_mapper: SourceIDMapper)
+
+    The source_mapper provides camera_id <-> source_id mapping for probes.
+    """
 
     @property
     @abstractmethod
     def name(self) -> str:
-        pass
-
-    @abstractmethod
-    def setup(self, config: dict, sink: BaseSink) -> None:
         pass
 
     @abstractmethod
@@ -54,15 +56,17 @@ class ProcessorRegistry:
         return decorator
 
     @classmethod
-    def create_for_config(cls, config: dict) -> list:
-        """Create processors for configured branches."""
-        processors = []
+    def get_classes_for_config(cls, config: dict) -> dict[str, type]:
+        """Get processor classes for configured branches (not instances).
+
+        Returns dict of {branch_name: processor_class} for instantiation later.
+        """
+        classes = {}
         for name in config.get("pipeline", {}).get("branches", {}):
             if name in cls._registry:
-                proc = cls._registry[name]()
-                processors.append(proc)
-                print(f"[ProcessorRegistry] Created: {proc.__class__.__name__} for '{name}'")
-        return processors
+                classes[name] = cls._registry[name]
+                print(f"[ProcessorRegistry] Found: {cls._registry[name].__name__} for '{name}'")
+        return classes
 
     @classmethod
     def auto_import(cls, apps_dir: str = "apps") -> None:

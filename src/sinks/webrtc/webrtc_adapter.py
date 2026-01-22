@@ -17,6 +17,7 @@ from gi.repository import Gst, GstSdp, GstWebRTC
 import websockets
 
 from src.sinks.base_sink import BaseSink
+from src.common import link_chain
 
 
 class WebRTCAdapter(BaseSink):
@@ -119,10 +120,7 @@ class WebRTCAdapter(BaseSink):
 
         # Link encoding chain
         elements = [conv2, caps2, queue_enc, enc, h264parse, pay, rtpcaps]
-
-        for i in range(len(elements) - 1):
-            if not elements[i].link(elements[i + 1]):
-                raise RuntimeError(f"Failed to link {elements[i].get_name()}")
+        link_chain(elements)
 
         # Link to WebRTC bin
         rtpcaps.link(self.webrtc)

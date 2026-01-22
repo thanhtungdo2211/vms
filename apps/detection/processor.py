@@ -53,33 +53,30 @@ def update_display(obj_meta, detection_count: int, score: float = 0.0) -> None:
 class DetectionProcessor:
     """
     Object detection branch processor implementation.
-    
+
     Handles:
     - FPS monitoring (via fps_probe_factory)
     - Detection statistics
     - Object counting per frame
-    
+
     Config params (from branch YAML):
         params:
             log_interval: seconds between FPS logs (default: 1.0)
             stats_interval: seconds between stats logs (default: 10.0)
     """
-    
-    def __init__(self):
-        self._config: Dict[str, Any] = {}
-        self._sink = None
+
+    def __init__(self, config: Dict[str, Any], sink: BaseSink, source_mapper=None):
+        self._config = config
+        self._sink = sink
+        self._source_mapper = source_mapper
         self._total_frames = 0
         self._total_objects = 0
-    
+        params = config.get("params", {})
+        print(f"[DetectionProcessor] Initialized (log_interval={params.get('log_interval', 1.0)}s)")
+
     @property
     def name(self) -> str:
         return "detection"
-    
-    def setup(self, config: Dict[str, Any], sink: BaseSink) -> None:
-        self._config = config
-        self._sink = sink
-        params = config.get("params", {})
-        print(f"[DetectionProcessor] Setup complete (log_interval={params.get('log_interval', 1.0)}s)")
     
     def _get_stats(self) -> dict:
         """Return stats dict for FPSMonitor"""

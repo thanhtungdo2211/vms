@@ -30,8 +30,7 @@ from gi.repository import Gst
 if TYPE_CHECKING:
     from src.pipeline_builder import BranchInfo
 
-from src.common import make_element
-
+from src.common import make_element, get_nvvidconv_props, link_chain
 logger = logging.getLogger(__name__)
 
 STATE_CHANGE_TIMEOUT = 5 * Gst.SECOND
@@ -143,12 +142,7 @@ class WarmupManager:
             })
 
             # nvvideoconvert - convert to GPU memory
-            try:
-                nvconv = make_element("nvvideoconvert", None, {
-                    "gpu-id": self._gpu_id
-                })
-            except RuntimeError:
-                nvconv = None
+            nvconv = make_element("nvvideoconvert", None, get_nvvidconv_props())
 
             # tee for fanout to multiple branches
             tee = make_element("tee", f"tee_{self.WARMUP_CAMERA_ID}", {

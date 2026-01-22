@@ -168,24 +168,21 @@ class FireDetectionProcessor:
     - Events: fire_detected, smoke_detected, helmet_violation
     """
 
-    def __init__(self, source_mapper=None):
-        self._config: Dict[str, Any] = {}
-        self._sink: Optional[BaseSink] = None
+    def __init__(self, config: Dict[str, Any], sink: BaseSink, source_mapper=None):
+        """Initialize fire detection processor.
+
+        Args:
+            config: Branch configuration dict
+            sink: BaseSink for sending events
+            source_mapper: SourceIDMapper for camera_id <-> source_id mapping
+        """
+        self._config = config
+        self._sink = sink
         self._source_mapper = source_mapper
-        self._sent_events: Optional[EventSet] = None
-        self._cleanup_runner: Optional[IntervalRunner] = None
         self._frame_count = 0
         # Internal camera mapping: source_id -> camera_id
         self._camera_map: Dict[int, str] = {}
 
-    @property
-    def name(self) -> str:
-        return "fire_detection"
-
-    def setup(self, config: Dict[str, Any], sink: BaseSink) -> None:
-        """Initialize fire detection components."""
-        self._config = config
-        self._sink = sink
         params = config.get("params", {})
 
         # Initialize event tracking
@@ -197,9 +194,13 @@ class FireDetectionProcessor:
         for idx, camera_id in enumerate(cameras.keys()):
             self._camera_map[idx] = camera_id
 
-        print(f"[FireDetectionProcessor] Setup complete")
+        print(f"[FireDetectionProcessor] Initialized")
         print(f"  - Cameras config: {list(cameras.keys())}")
         print(f"  - Camera map: {self._camera_map}")
+
+    @property
+    def name(self) -> str:
+        return "fire_detection"
 
     def get_probes(self) -> Dict[str, Callable]:
         """Return probe callbacks."""
@@ -455,10 +456,6 @@ class FireDetectionProcessor:
     def on_stop(self) -> None:
         """Called when pipeline stops."""
         print("[FireDetectionProcessor] Stopped")
-
-    def set_source_mapper(self, source_mapper) -> None:
-        """Set source mapper for camera ID lookup (legacy, uses internal mapping now)."""
-        self._source_mapper = source_mapper
 
     def get_stats(self) -> Optional[Dict[str, Any]]:
         """Return processor statistics."""

@@ -283,9 +283,16 @@ class PlateRecognitionProcessor:
             visualize_keypoints: true
     """
 
-    def __init__(self, source_mapper=None):
-        self._config: Dict[str, Any] = {}
-        self._sink: Optional[BaseSink] = None
+    def __init__(self, config: Dict[str, Any], sink: BaseSink, source_mapper=None):
+        """Initialize plate recognition processor.
+
+        Args:
+            config: Branch configuration dict
+            sink: BaseSink for sending events
+            source_mapper: SourceIDMapper for camera_id <-> source_id mapping
+        """
+        self._config = config
+        self._sink = sink
         self._source_mapper = source_mapper
 
         # Stats
@@ -293,9 +300,10 @@ class PlateRecognitionProcessor:
         self._total_frames = 0
         self._total_ocr_results = 0
 
-        # Muxer dimensions (from config)
-        self._muxer_width = 1920
-        self._muxer_height = 1080
+        # Muxer dimensions from config
+        muxer = config.get("muxer", {})
+        self._muxer_width = muxer.get("width", 1920)
+        self._muxer_height = muxer.get("height", 1080)
 
         # OCR multiprocessing
         self._input_queue: Optional[mp.Queue] = None
@@ -308,22 +316,8 @@ class PlateRecognitionProcessor:
         self._ocr_cache: Dict[int, Tuple[str, float]] = {}
         self._ocr_cache_lock = threading.Lock()
 
-    @property
-    def name(self) -> str:
-        return "plate_recognition"
-
-    def setup(self, config: Dict[str, Any], sink: BaseSink) -> None:
-        """Initialize plate detection components."""
-        self._config = config
-        self._sink = sink
-        params = config.get("params", {})
-
-        # Muxer dimensions from config
-        muxer = config.get("muxer", {})
-        self._muxer_width = muxer.get("width", 1920)
-        self._muxer_height = muxer.get("height", 1080)
-
         # OCR configuration (all params from config.yaml)
+        params = config.get("params", {})
         engine_path = params["ocr_engine_path"]
         dict_path = params["ocr_dict_path"]
         queue_size = params.get("ocr_queue_size", 100)
@@ -343,10 +337,14 @@ class PlateRecognitionProcessor:
             input_shape=input_shape,
         )
 
-        print(f"[PlateRecognitionProcessor] Setup complete "
+        print(f"[PlateRecognitionProcessor] Initialized "
               f"(point_thresh={params.get('point_confidence_threshold', 0.5)}, "
               f"visualize_keypoints={params.get('visualize_keypoints', True)}, "
               f"ocr_engine={os.path.basename(engine_path)})")
+
+    @property
+    def name(self) -> str:
+        return "plate_recognition"
 
     def _get_stats(self) -> dict:
         """Return stats dict for FPSMonitor."""
@@ -529,7 +527,3 @@ class PlateRecognitionProcessor:
             "total_frames": self._total_frames,
             "total_ocr_results": self._total_ocr_results,
         }
-
-    def set_source_mapper(self, source_mapper) -> None:
-        """Set source mapper for camera ID resolution."""
-        self._source_mapper = source_mapper

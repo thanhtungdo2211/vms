@@ -17,19 +17,17 @@ from apps.area_monitoring.roi_config_generator import get_analytics_config_manag
 
 @ProcessorRegistry.register("area_monitoring")
 class AreaMonitoringProcessor:
-    def __init__(self, source_mapper=None):
-        self._config: Dict[str, Any] = {}
-        self._sink: Optional[BaseSink] = None
-        self._analytics_manager = None
+    def __init__(self, config: Dict[str, Any], sink: BaseSink, source_mapper=None):
+        """Initialize area monitoring processor.
 
-    @property
-    def name(self) -> str:
-        return "area_monitoring"
-
-    def setup(self, config: Dict[str, Any], sink: BaseSink) -> None:
-        """Initialize area monitoring components"""
+        Args:
+            config: Branch configuration dict
+            sink: BaseSink for sending events
+            source_mapper: SourceIDMapper for camera_id <-> source_id mapping
+        """
         self._config = config
         self._sink = sink
+        self._source_mapper = source_mapper
 
         # Initialize analytics config manager
         self._analytics_manager = get_analytics_config_manager("area_monitoring")
@@ -47,6 +45,12 @@ class AreaMonitoringProcessor:
         # Pre-register cameras from config (static setup)
         for idx, (camera_id, camera_config) in enumerate(cameras.items()):
             self._analytics_manager.add_camera(camera_id, idx, camera_config)
+
+        print("[AreaMonitoringProcessor] Initialized")
+
+    @property
+    def name(self) -> str:
+        return "area_monitoring"
 
     def get_probes(self) -> Dict[str, Callable]:
         """Return probe callbacks"""

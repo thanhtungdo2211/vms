@@ -5,7 +5,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
 from src.sinks.base_sink import BaseSink
-from src.common import get_nvvidconv_props, get_encoder_element, detect_platform
+from src.common import get_nvvidconv_props, get_encoder_element, detect_platform, link_chain
 
 
 class FilesinkAdapter(BaseSink):
@@ -45,9 +45,7 @@ class FilesinkAdapter(BaseSink):
 
         for elem in chain:
             pipeline.add(elem)
-        for i in range(len(chain) - 1):
-            if not chain[i].link(chain[i + 1]):
-                raise RuntimeError(f"Failed to link {chain[i].get_name()} -> {chain[i+1].get_name()}")
+        link_chain(chain)
 
         self.elements = chain
         print(f"[FilesinkAdapter] Using encoder: {enc_factory} ({platform.name})")

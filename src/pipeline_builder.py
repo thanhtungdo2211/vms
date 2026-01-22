@@ -21,7 +21,7 @@ from gi.repository import Gst
 if "/opt/nvidia/deepstream/deepstream/lib" not in sys.path:
     sys.path.append("/opt/nvidia/deepstream/deepstream/lib")
 
-from src.common import load_config, make_element, get_nvvidconv_props
+from src.common import load_config, make_element, get_nvvidconv_props, link_chain
 from src.probe_registry import ProbeRegistry
 from src.processor_registry import BranchProcessor, ProcessorRegistry
 from src.sinks.base_sink import BaseSink
@@ -48,7 +48,6 @@ class BranchInfo:
     sink: Optional[Gst.Element] = None
     max_cameras: int = 8
 
-
 class PipelineBuilder:
     """Config-driven multi-branch DeepStream pipeline builder."""
 
@@ -60,18 +59,23 @@ class PipelineBuilder:
         self.branches: dict[str, BranchInfo] = {}
         self.processors: dict[str, BranchProcessor] = {}
 
-        # Runtime components (created during start_api)
-        self._camera_manager = None
-        self._stream_publisher = None
-        self._api_server = None
+        # Store processor classes for deferred instantiation
+        self.processor_classes: dict[str, type] = {}
+
+        # Runtime components (created during build)
+        self.camera_manager = None
+        self.stream_publisher = None
+        self.api_server = None
+
 
         if processors:
+            # Pre-instantiated processors (for backward compatibility)
             for p in processors:
                 self.processors[p.name] = p
         elif auto_discover:
+            # Auto-discover processor classes (instantiation deferred to start_api)
             ProcessorRegistry.auto_import("apps")
-            for p in ProcessorRegistry.create_for_config(config):
-                self.processors[p.name] = p
+            self.processor_classes = ProcessorRegistry.get_classes_for_config(config)
 
         self.branch_sinks = branch_sinks if branch_sinks else self._create_sinks()
 
@@ -103,14 +107,21 @@ class PipelineBuilder:
         return sinks
 
     def build(self) -> Gst.Pipeline:
-        """Build pipeline from config and initialize to READY state.
+        """Build pipeline from config and start all components.
 
         Handles:
         - Signal handlers setup for graceful shutdown
+        - Building branch elements
         - Starting sinks
-        - Setting pipeline to READY state
-        - Running warmup to pre-load TensorRT engines
+        - Creating camera manager with SourceIDMapper
+        - Instantiating processors with SourceIDMapper
+        - Creating stream publisher
+        - Warmup and starting API server
         """
+        from src.camera_manager import MultibranchCameraManager
+        from src.stream_publisher import StreamPublisher
+        from src.api.camera_api import CameraAPIServer
+
         Gst.init(None)
         setup_signal_handlers()
 
@@ -120,23 +131,9 @@ class PipelineBuilder:
         if not branches_cfg:
             raise RuntimeError("No branches configured")
 
-        # Setup processors
-        for name, cfg in branches_cfg.items():
-            if name in self.processors:
-                if isinstance(cfg, str):
-                    cfg = load_config(cfg)
-                self.processors[name].setup(cfg, self.branch_sinks[name])
-                for probe_name, cb in self.processors[name].get_probes().items():
-                    self.probe_registry.register(probe_name, cb)
-
         # Build branches
         for name, cfg in branches_cfg.items():
             self._build_branch(name, cfg)
-
-        # Notify processors
-        for name, proc in self.processors.items():
-            if name in self.branches:
-                proc.on_pipeline_built(self.pipeline, self.branches[name])
 
         self.pipeline.get_bus().add_signal_watch()
         logger.info(f"Pipeline built: {len(self.branches)} branches")
@@ -144,6 +141,52 @@ class PipelineBuilder:
         # Start sinks
         for sink in self.branch_sinks.values():
             sink.start()
+
+        # Create camera manager (provides SourceIDMapper)
+        self.camera_manager = MultibranchCameraManager(self.pipeline, self.branches)
+        source_mapper = self.camera_manager.get_mapper()
+
+        # Instantiate processors with config, sink, and source_mapper
+        for name, proc_class in self.processor_classes.items():
+            cfg = branches_cfg.get(name, {})
+            if isinstance(cfg, str):
+                cfg = load_config(cfg)
+            sink = self.branch_sinks.get(name)
+
+            # Instantiate processor with __init__(config, sink, source_mapper)
+            proc = proc_class(cfg, sink, source_mapper)
+            self.processors[name] = proc
+            print(f"[PipelineBuilder] Instantiated: {proc_class.__name__} for '{name}'")
+
+            # Register probes
+            for probe_name, cb in proc.get_probes().items():
+                self.probe_registry.register(probe_name, cb)
+
+        # Notify processors that pipeline is built
+        for name, proc in self.processors.items():
+            if name in self.branches:
+                proc.on_pipeline_built(self.pipeline, self.branches[name])
+
+        # Create SRT publisher (MUST be before READY state - needs NULL state pads)
+        self.stream_publisher = StreamPublisher(
+            self.pipeline, self.branches, self.camera_manager
+        )
+        logger.info("Stream publisher created (per-camera annotated streams)")
+
+        # Set READY and warmup
+        if not self.set_ready_and_warmup():
+            raise RuntimeError("Failed to set pipeline READY state")
+
+        # Start processors
+        self.start_processors()
+
+        # Start API server
+        self.api_server = CameraAPIServer(
+            self.config.get("camera_api", {}),
+            self.camera_manager,
+            stream_publisher=self.stream_publisher
+        )
+        self.api_server.start()
 
         return self.pipeline
 
@@ -216,22 +259,13 @@ class PipelineBuilder:
 
         # Link chain - special handling for demux
         if demux_elem:
-            self._link_chain(chain, stop_at=demux_elem)
+            link_chain(chain, stop_at=demux_elem)
             logger.info(f"[{name}] Branch with nvstreamdemux - per-camera RTSP via demux pads")
         else:
             chain.append(sink)
-            self._link_chain(chain)
+            link_chain(chain)
 
         self.branches[name] = BranchInfo(name, mux, chain[1:-1] if not demux_elem else chain[1:], sink, cfg.get("max_cameras", 8))
-
-    def _link_chain(self, chain: list[Gst.Element], stop_at: Gst.Element = None) -> None:
-        """Link elements in chain sequentially. Stops after linking to stop_at element."""
-        for i in range(len(chain) - 1):
-            src, dst = chain[i], chain[i + 1]
-            if not src.link(dst):
-                raise RuntimeError(f"Failed to link {src.get_name()} -> {dst.get_name()}")
-            if dst == stop_at:
-                break
 
     def _create_element(self, cfg: dict, prefix: str) -> Gst.Element:
         """Create GStreamer element from config.
@@ -325,16 +359,6 @@ class PipelineBuilder:
         elem.set_property("config-file", config_path)
         logger.info(f"[nvdsanalytics] Auto-configured: {config_path}")
 
-    def set_bus_callback(self, callback: Callable) -> None:
-        """Set bus message callback."""
-        self.pipeline.get_bus().connect("message", callback)
-
-    def get_processor(self, name: str) -> Optional[BranchProcessor]:
-        return self.processors.get(name)
-
-    def get_branch(self, name: str) -> Optional[BranchInfo]:
-        return self.branches.get(name)
-
     def start_processors(self) -> None:
         for p in self.processors.values():
             p.on_start()
@@ -343,49 +367,12 @@ class PipelineBuilder:
         for p in self.processors.values():
             p.on_stop()
 
-    def start_api(self) -> None:
-        """Create and start camera manager, RTSP publisher, and API server.
-
-        Must be called AFTER build() but BEFORE set_ready_and_warmup().
-        Creates:
-        - MultibranchCameraManager for dynamic camera control
-        - StreamPublisher for per-camera SRT streams
-        - CameraAPIServer for REST API
-        """
-        from src.camera_manager import MultibranchCameraManager
-        from src.stream_publisher import StreamPublisher
-        from src.api.camera_api import CameraAPIServer
-
-        # Create camera manager
-        self._camera_manager = MultibranchCameraManager(self.pipeline, self.branches)
-
-        # Create SRT publisher (MUST be before READY state - needs NULL state pads)
-        self._stream_publisher = StreamPublisher(
-            self.pipeline, self.branches, self._camera_manager
-        )
-        logger.info("Stream publisher created (per-camera annotated streams)")
-
-        # Set READY and warmup
-        if not self.set_ready_and_warmup():
-            raise RuntimeError("Failed to set pipeline READY state")
-
-        # Start processors
-        self.start_processors()
-
-        # Start API server
-        self._api_server = CameraAPIServer(
-            self.config.get("camera_api", {}),
-            self._camera_manager,
-            stream_publisher=self._stream_publisher
-        )
-        self._api_server.start()
-
     def shutdown(self) -> None:
         """Graceful shutdown sequence."""
         logger.info("Shutting down...")
 
-        if self._api_server:
-            self._api_server.stop()
+        if self.api_server:
+            self.api_server.stop()
 
         self.stop_processors()
 
@@ -402,19 +389,4 @@ class PipelineBuilder:
         while not stop_event.is_set():
             threading.Event().wait(1)
         self.shutdown()
-
-    @property
-    def camera_manager(self):
-        """Access camera manager (available after start_api)."""
-        return self._camera_manager
-
-    @property
-    def stream_publisher(self):
-        """Access stream publisher (available after start_api)."""
-        return self._stream_publisher
-
-    @property
-    def api_server(self):
-        """Access API server (available after start_api)."""
-        return self._api_server
 
