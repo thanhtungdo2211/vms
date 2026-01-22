@@ -275,7 +275,7 @@ class MultibranchCameraManager:
     # ─────────────────────────────────────────────────────────────────────────
 
     def add_camera(self, camera_id: str, uri: str, branch_names: list[str]) -> bool:
-        """Add camera to branches with safe pipeline state management."""
+        """Add camera to branches dynamically without pausing pipeline."""
         with self._lock:
             self._delay()
             if camera_id in self._cameras:
@@ -286,18 +286,12 @@ class MultibranchCameraManager:
                 return False
 
             _, prev_state, _ = self.pipeline.get_state(0)
-            is_first = len(self._cameras) == 0
             is_rtsp = uri.startswith("rtsp://") or uri.startswith("rtsps://")
             is_file = uri.startswith("file://")
 
-            logger.info(f"[CAM] Adding {camera_id} - state: {prev_state.value_nick}, first: {is_first}")
+            logger.info(f"[CAM] Adding {camera_id} - state: {prev_state.value_nick}")
 
             try:
-                # Pause if playing
-                if prev_state == Gst.State.PLAYING:
-                    if not self._pause_pipeline():
-                        return False
-
                 # Create camera bin
                 source_id = self._mapper.add(camera_id, uri)
                 bin_elem = Gst.Bin.new(f"cam_{camera_id}")
@@ -322,8 +316,17 @@ class MultibranchCameraManager:
                     pad = self._link_branch(bin_elem, tee, camera_id, source_id, b, sync=False)
                     branch_pads[b] = pad
 
-                # Sync camera state
-                self._sync_camera_state(bin_elem, prev_state, is_file, pad_linked_event)
+                # Wait for file source pad linking
+                if is_file and pad_linked_event:
+                    logger.info("[CAM] Waiting for uridecodebin pad linking...")
+                    pad_linked_event.wait(timeout=5.0)
+                    time.sleep(0.5)
+
+                # Sync camera bin and pipeline to PLAYING
+                self._incremental_state_sync(bin_elem, Gst.State.PLAYING)
+                if prev_state != Gst.State.PLAYING:
+                    self._resume_pipeline()
+                time.sleep(2.0)
 
                 # Store camera
                 self._cameras[camera_id] = CameraInfo(
@@ -331,54 +334,16 @@ class MultibranchCameraManager:
                     uri=uri, branch_pads=branch_pads, is_file=is_file
                 )
 
-                # Transition pipeline
-                self._transition_pipeline_after_add(bin_elem, prev_state, is_file)
-
                 self._last_op = time.time()
                 logger.info(f"[CAM] Added {camera_id} to branches: {branches}")
                 return True
 
             except Exception as e:
                 logger.error(f"add_camera failed: {e}", exc_info=True)
-                self._cleanup_failed_add(camera_id, bin_elem, prev_state)
+                self._cleanup_failed_add(camera_id, bin_elem)
                 return False
 
-    def _sync_camera_state(self, bin_elem: Gst.Bin, prev_state: Gst.State,
-                           is_file: bool, pad_linked_event: Optional[threading.Event]) -> None:
-        """Sync camera bin to appropriate state."""
-        if prev_state == Gst.State.READY:
-            self._incremental_state_sync(bin_elem, Gst.State.READY)
-        elif prev_state in (Gst.State.PAUSED, Gst.State.PLAYING):
-            self._incremental_state_sync(bin_elem, Gst.State.PAUSED)
-            if is_file and pad_linked_event:
-                logger.info("[CAM] Waiting for uridecodebin pad linking...")
-                if pad_linked_event.wait(timeout=5.0):
-                    time.sleep(0.5)
-                else:
-                    logger.warning("[CAM] Timeout waiting for pad linking")
-            else:
-                time.sleep(1.0)
-
-    def _transition_pipeline_after_add(self, bin_elem: Gst.Bin, prev_state: Gst.State, is_file: bool) -> None:
-        """Transition pipeline to PLAYING after adding camera."""
-        if prev_state == Gst.State.READY:
-            logger.info("[CAM] Pipeline READY -> PAUSED -> PLAYING")
-            self.pipeline.set_state(Gst.State.PAUSED)
-            self.pipeline.get_state(10 * Gst.SECOND)
-            time.sleep(2.0)
-            self._resume_pipeline()
-
-        elif prev_state == Gst.State.PAUSED:
-            time.sleep(2.0)
-            self._resume_pipeline()
-            self._incremental_state_sync(bin_elem, Gst.State.PLAYING)
-
-        elif prev_state == Gst.State.PLAYING:
-            self._resume_pipeline()
-            self._incremental_state_sync(bin_elem, Gst.State.PLAYING)
-            time.sleep(3.0)
-
-    def _cleanup_failed_add(self, camera_id: str, bin_elem: Gst.Bin, prev_state: Gst.State) -> None:
+    def _cleanup_failed_add(self, camera_id: str, bin_elem: Gst.Bin) -> None:
         """Cleanup after failed add_camera."""
         try:
             if camera_id in self._cameras:
@@ -387,8 +352,6 @@ class MultibranchCameraManager:
         except:
             pass
         self._mapper.remove(camera_id)
-        if prev_state == Gst.State.PLAYING:
-            self.pipeline.set_state(Gst.State.PLAYING)
 
     def remove_camera(self, camera_id: str) -> bool:
         """Remove camera from all branches."""
