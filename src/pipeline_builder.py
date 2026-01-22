@@ -2,29 +2,31 @@
 
 from __future__ import annotations
 
-import asyncio
+# Standard library
 import configparser
 import logging
 import os
+import signal
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+# Third-party
 import gi
 gi.require_version("Gst", "1.0")
-from gi.repository import GLib, Gst
+from gi.repository import Gst
 
+# Local
 if "/opt/nvidia/deepstream/deepstream/lib" not in sys.path:
     sys.path.append("/opt/nvidia/deepstream/deepstream/lib")
 
-logger = logging.getLogger(__name__)
-
-from src.sinks.base_sink import BaseSink
+from src.common import load_config, make_element
 from src.probe_registry import ProbeRegistry
-from src.common import load_config
-from src.processor_registry import ProcessorRegistry, BranchProcessor
-import signal
-import threading
+from src.processor_registry import BranchProcessor, ProcessorRegistry
+from src.sinks.base_sink import BaseSink
+
+logger = logging.getLogger(__name__)
 
 stop_event = threading.Event()
 def setup_signal_handlers():
@@ -188,14 +190,13 @@ class PipelineBuilder:
             cfg = load_config(cfg)
 
         # Create muxer
-        mux = Gst.ElementFactory.make("nvstreammux", f"mux_{name}")
         muxer_cfg = cfg.get("muxer", {})
-        for k, v in muxer_cfg.items():
-            mux.set_property(k.replace("-", "_"), v)
-        mux.set_property("live_source", muxer_cfg.get("live-source", 1))
-        # Use memory type from config (4=CUDA_UNIFIED for numpy access, 0=default)
-        mem_type = muxer_cfg.get("nvbuf-memory-type", 0)
-        mux.set_property("nvbuf_memory_type", mem_type)
+        mux_props = {
+            "live-source": muxer_cfg.get("live-source", 1),
+            "nvbuf-memory-type": muxer_cfg.get("nvbuf-memory-type", 0),
+            **{k: v for k, v in muxer_cfg.items() if k not in ("live-source", "nvbuf-memory-type")}
+        }
+        mux = make_element("nvstreammux", f"mux_{name}", mux_props)
         self.pipeline.add(mux)
 
         # Create element chain
@@ -215,39 +216,34 @@ class PipelineBuilder:
 
         # Link chain - special handling for demux
         if demux_elem:
-            # Link everything up to demux, demux is terminal (pads are dynamic)
-            for i in range(len(chain) - 1):
-                if chain[i + 1] == demux_elem:
-                    # Link to demux sink pad
-                    if not chain[i].link(demux_elem):
-                        raise RuntimeError(f"Failed to link {chain[i].get_name()} -> demux")
-                    break
-                if not chain[i].link(chain[i + 1]):
-                    raise RuntimeError(f"Failed to link {chain[i].get_name()} -> {chain[i + 1].get_name()}")
-            # Demux doesn't link to sink - per-camera RTSP chains attach to demux src pads
+            self._link_chain(chain, stop_at=demux_elem)
             logger.info(f"[{name}] Branch with nvstreamdemux - per-camera RTSP via demux pads")
         else:
-            # Normal chain with sink
             chain.append(sink)
-            for i in range(len(chain) - 1):
-                if not chain[i].link(chain[i + 1]):
-                    raise RuntimeError(f"Failed to link {chain[i].get_name()} -> {chain[i + 1].get_name()}")
+            self._link_chain(chain)
 
         self.branches[name] = BranchInfo(name, mux, chain[1:-1] if not demux_elem else chain[1:], sink, cfg.get("max_cameras", 8))
+
+    def _link_chain(self, chain: list[Gst.Element], stop_at: Gst.Element = None) -> None:
+        """Link elements in chain sequentially. Stops after linking to stop_at element."""
+        for i in range(len(chain) - 1):
+            src, dst = chain[i], chain[i + 1]
+            if not src.link(dst):
+                raise RuntimeError(f"Failed to link {src.get_name()} -> {dst.get_name()}")
+            if dst == stop_at:
+                break
 
     def _create_element(self, cfg: dict, prefix: str) -> Gst.Element:
         """Create GStreamer element from config."""
         elem_type = cfg["type"]
         name = f"{prefix}_{cfg.get('name', elem_type)}"
-        elem = Gst.ElementFactory.make(elem_type, name)
-        if not elem:
-            raise RuntimeError(f"Cannot create: {elem_type}")
+        props = cfg.get("properties", {})
 
-        for k, v in cfg.get("properties", {}).items():
-            elem.set_property(k, v)
-
+        # Handle caps specially
         if "caps" in cfg:
-            elem.set_property("caps", Gst.Caps.from_string(cfg["caps"]))
+            props = {**props, "caps": Gst.Caps.from_string(cfg["caps"])}
+
+        elem = make_element(elem_type, name, props)
 
         if "config_file" in cfg:
             path = cfg["config_file"]
@@ -411,61 +407,3 @@ class PipelineBuilder:
         """Access API server (available after start_api)."""
         return self._api_server
 
-    def run(self) -> None:
-        """Run pipeline with GLib main loop."""
-        if not self.pipeline:
-            self.build()
-
-        loop = GLib.MainLoop()
-
-        def on_msg(_bus, msg):
-            if msg.type == Gst.MessageType.EOS:
-                loop.quit()
-            elif msg.type == Gst.MessageType.ERROR:
-                err, _ = msg.parse_error()
-                logger.error(f"Pipeline error: {err.message}")
-                loop.quit()
-
-        self.set_bus_callback(on_msg)
-
-        try:
-            self.pipeline.set_state(Gst.State.PLAYING)
-            self.start_processors()
-            loop.run()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.stop_processors()
-            self.pipeline.set_state(Gst.State.NULL)
-
-    async def run_async(self, setup_callback: Callable = None) -> None:
-        """Run pipeline with asyncio."""
-        if not self.pipeline:
-            self.build()
-
-        stop = asyncio.Event()
-
-        def on_msg(_bus, msg):
-            if msg.type in (Gst.MessageType.EOS, Gst.MessageType.ERROR):
-                if msg.type == Gst.MessageType.ERROR:
-                    err, _ = msg.parse_error()
-                    logger.error(f"Pipeline error: {err.message}")
-                stop.set()
-
-        self.set_bus_callback(on_msg)
-
-        try:
-            if setup_callback:
-                await setup_callback()
-            self.pipeline.set_state(Gst.State.PLAYING)
-            self.start_processors()
-            await stop.wait()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.stop_processors()
-            self.pipeline.set_state(Gst.State.NULL)
-
-
-# Backward compatibility
-TeeFanoutPipelineBuilder = PipelineBuilder

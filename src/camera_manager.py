@@ -14,6 +14,7 @@ from gi.repository import Gst
 
 from src.pipeline_builder import BranchInfo
 from src.source_mapper import SourceIDMapper
+from src.common import make_element
 
 logger = logging.getLogger(__name__)
 
@@ -136,15 +137,16 @@ class MultibranchCameraManager:
     def _create_rtsp_source(self, camera_id: str, uri: str, source_id: int,
                             bin_elem: Gst.Bin, tee: Gst.Element, linked_state: dict) -> Gst.Element:
         """Create nvurisrcbin source for RTSP streams."""
-        source = Gst.ElementFactory.make("nvurisrcbin", f"nvurisrc_{camera_id}")
-        source.set_property("uri", uri)
-        source.set_property("gpu-id", self._gpu_id)
-        source.set_property("disable-audio", True)
-        source.set_property("source-id", source_id)
-        source.set_property("cudadec-memtype", 0)
-        source.set_property("num-extra-surfaces", 2)
-        source.set_property("latency", 500)
-        source.set_property("drop-frame-interval", 0)
+        source = make_element("nvurisrcbin", f"nvurisrc_{camera_id}", {
+            "uri": uri,
+            "gpu-id": self._gpu_id,
+            "disable-audio": True,
+            "source-id": source_id,
+            "cudadec-memtype": 0,
+            "num-extra-surfaces": 2,
+            "latency": 500,
+            "drop-frame-interval": 0
+        })
         bin_elem.add(source)
 
         callback = self._create_pad_callback(tee, camera_id, linked_state, video_prefix="vsrc_")
@@ -155,8 +157,7 @@ class MultibranchCameraManager:
     def _create_file_source(self, camera_id: str, uri: str, bin_elem: Gst.Bin,
                             tee: Gst.Element, linked_state: dict) -> tuple[Gst.Element, threading.Event]:
         """Create uridecodebin source for file/HTTP sources."""
-        source = Gst.ElementFactory.make("uridecodebin", f"uridecodebin_{camera_id}")
-        source.set_property("uri", uri)
+        source = make_element("uridecodebin", f"uridecodebin_{camera_id}", {"uri": uri})
         bin_elem.add(source)
 
         pad_linked_event = threading.Event()
@@ -174,11 +175,12 @@ class MultibranchCameraManager:
         """Link: tee -> queue -> mux."""
         b = self.branches[branch_name]
 
-        q = Gst.ElementFactory.make("queue", f"q_{camera_id}_{branch_name}")
-        q.set_property("max-size-buffers", 30)
-        q.set_property("max-size-bytes", 0)
-        q.set_property("max-size-time", 0)
-        q.set_property("leaky", 2)
+        q = make_element("queue", f"q_{camera_id}_{branch_name}", {
+            "max-size-buffers": 30,
+            "max-size-bytes": 0,
+            "max-size-time": 0,
+            "leaky": 2
+        })
         bin_elem.add(q)
 
         tee_src = tee.request_pad_simple("src_%u")
@@ -295,8 +297,7 @@ class MultibranchCameraManager:
                 # Create camera bin
                 source_id = self._mapper.add(camera_id, uri)
                 bin_elem = Gst.Bin.new(f"cam_{camera_id}")
-                tee = Gst.ElementFactory.make("tee", f"tee_{camera_id}")
-                tee.set_property("allow-not-linked", True)
+                tee = make_element("tee", f"tee_{camera_id}", {"allow-not-linked": True})
                 bin_elem.add(tee)
 
                 linked_state = {"done": False}

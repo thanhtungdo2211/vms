@@ -39,6 +39,38 @@ def load_config(path: str) -> dict:
 
 
 # =============================================================================
+# GStreamer Element Factory
+# =============================================================================
+
+def make_element(factory: str, name: str, props: dict = None) -> Gst.Element:
+    """Create GStreamer element with properties.
+
+    Args:
+        factory: Element factory name (e.g., "queue", "nvvideoconvert")
+        name: Element instance name
+        props: Properties dict. Keys can use "-" (auto-converted to "_")
+
+    Returns:
+        Configured Gst.Element
+
+    Raises:
+        RuntimeError: If element creation fails
+
+    Example:
+        queue = make_element("queue", "my_queue", {
+            "max-size-buffers": 30,
+            "leaky": 2
+        })
+    """
+    elem = Gst.ElementFactory.make(factory, name)
+    if not elem:
+        raise RuntimeError(f"Cannot create element: {factory}")
+    for k, v in (props or {}).items():
+        elem.set_property(k.replace("-", "_"), v)
+    return elem
+
+
+# =============================================================================
 # DeepStream Metadata Extractors
 # =============================================================================
 
