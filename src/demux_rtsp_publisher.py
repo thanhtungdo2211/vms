@@ -201,7 +201,7 @@ class DemuxRtspPublisher:
                 logger.error(f"[DemuxRTSP] Camera {camera_id} not found")
                 return False
 
-            source_id = cam["source_id"]
+            source_id = cam.source_id
 
             # Get demux element
             demux = self._get_demux(branch_name)
