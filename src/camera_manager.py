@@ -420,9 +420,8 @@ class MultibranchCameraManager:
 
             logger.info(f"[CAM] Removing {camera_id} from {branch_name}")
 
-            # Check if branch will be empty
-            b = self.branches.get(branch_name)
-            branch_cam_count = self._count_branch_cameras(b) if b else 0
+            # Count cameras in this branch from synced dict
+            branch_cam_count = sum(1 for c in self._cameras.values() if branch_name in c.branch_pads)
             will_empty = branch_cam_count <= 1
 
             _, prev_state, _ = self.pipeline.get_state(0)
@@ -445,23 +444,6 @@ class MultibranchCameraManager:
                 if will_empty and prev_state == Gst.State.PLAYING:
                     self.pipeline.set_state(Gst.State.PLAYING)
                 return False
-
-    def _count_branch_cameras(self, branch: BranchInfo) -> int:
-        """Count cameras linked to branch's nvstreammux."""
-        count = 0
-        if branch and branch.nvstreammux:
-            it = branch.nvstreammux.iterate_sink_pads()
-            while True:
-                result, pad = it.next()
-                if result == Gst.IteratorResult.OK:
-                    if pad.is_linked():
-                        count += 1
-                elif result == Gst.IteratorResult.RESYNC:
-                    it.resync()
-                    count = 0
-                else:
-                    break
-        return count
 
     def kill_all(self) -> int:
         """Remove all cameras - requires pipeline restart to add cameras again."""
