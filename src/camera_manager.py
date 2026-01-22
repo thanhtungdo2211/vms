@@ -175,7 +175,7 @@ class MultibranchCameraManager:
         """Link: tee -> queue -> mux."""
         b = self.branches[branch_name]
 
-        q = make_element("queue", f"q_{camera_id}_{branch_name}", {
+        q = make_element("queue", None, {
             "max-size-buffers": 30,
             "max-size-bytes": 0,
             "max-size-time": 0,
@@ -232,14 +232,13 @@ class MultibranchCameraManager:
             elif ret != Gst.IteratorResult.OK:
                 break
 
-        # Unlink tee from queue
-        q = cam.bin.get_by_name(f"q_{camera_id}_{branch_name}")
-        if q:
-            q_sink = q.get_static_pad("sink")
-            if q_sink and q_sink.is_linked():
-                peer = q_sink.get_peer()
-                if peer:
-                    peer.unlink(q_sink)
+        # Unlink tee from queue (get queue via tee_pad peer)
+        q = None
+        if tee_pad:
+            q_sink = tee_pad.get_peer()
+            if q_sink:
+                q = q_sink.get_parent()
+                tee_pad.unlink(q_sink)
 
         # Remove probe
         if probe_id and tee_pad:

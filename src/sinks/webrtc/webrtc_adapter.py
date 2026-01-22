@@ -78,7 +78,7 @@ class WebRTCAdapter(BaseSink):
         pipeline.add(self.webrtc)
 
         # Create encoding pipeline
-        def make_element(factory: str, name: str) -> Gst.Element:
+        def make_elem(factory: str, name: str = None) -> Gst.Element:
             elem = Gst.ElementFactory.make(factory, name)
             if not elem:
                 raise RuntimeError(f"Cannot create element: {factory}")
@@ -86,30 +86,30 @@ class WebRTCAdapter(BaseSink):
             return elem
 
         # Convert for encoding
-        conv2 = make_element("nvvideoconvert", "conv2")
+        conv2 = make_elem("nvvideoconvert")
         conv2.set_property("compute-hw", 1)
 
-        caps2 = make_element("capsfilter", "caps2")
+        caps2 = make_elem("capsfilter")
         caps2.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
 
-        queue_enc = make_element("queue", "queue_enc")
+        queue_enc = make_elem("queue")
         queue_enc.set_property("max-size-buffers", 3)
         queue_enc.set_property("leaky", 2)
 
         # H264 encoding
-        enc = make_element("x264enc", "encoder")
+        enc = make_elem("x264enc")
         enc.set_property("tune", "zerolatency")
         enc.set_property("speed-preset", "ultrafast")
         enc.set_property("key-int-max", 30)
         enc.set_property("bitrate", 2000)
 
-        h264parse = make_element("h264parse", "h264parse")
+        h264parse = make_elem("h264parse")
         h264parse.set_property("config-interval", -1)
 
-        pay = make_element("rtph264pay", "pay")
+        pay = make_elem("rtph264pay")
         pay.set_property("config-interval", -1)
 
-        rtpcaps = make_element("capsfilter", "rtpcaps")
+        rtpcaps = make_elem("capsfilter")
         rtpcaps.set_property(
             "caps",
             Gst.Caps.from_string(

@@ -132,19 +132,19 @@ class WarmupManager:
             self._warmup_bin = Gst.Bin.new(f"cam_{self.WARMUP_CAMERA_ID}")
 
             # videotestsrc - black pattern, infinite stream
-            src = make_element("videotestsrc", f"src_{self.WARMUP_CAMERA_ID}", {
+            src = make_element("videotestsrc", None, {
                 "pattern": 2,
                 "is-live": True
             })
 
             # capsfilter - match typical inference input size
-            caps = make_element("capsfilter", f"caps_{self.WARMUP_CAMERA_ID}", {
+            caps = make_element("capsfilter", None, {
                 "caps": Gst.Caps.from_string("video/x-raw,format=NV12,width=640,height=640,framerate=30/1")
             })
 
             # nvvideoconvert - convert to GPU memory
             try:
-                nvconv = make_element("nvvideoconvert", f"nvconv_{self.WARMUP_CAMERA_ID}", {
+                nvconv = make_element("nvvideoconvert", None, {
                     "gpu-id": self._gpu_id
                 })
             except RuntimeError:
@@ -180,9 +180,9 @@ class WarmupManager:
                 return False
         return True
 
-    def _create_queue(self, name: str, buffer_size: int = 30) -> Gst.Element:
+    def _create_queue(self, buffer_size: int = 30) -> Gst.Element:
         """Create queue element with standard properties."""
-        return make_element("queue", name, {
+        return make_element("queue", None, {
             "max-size-buffers": buffer_size,
             "max-size-bytes": 0,
             "max-size-time": 0,
@@ -210,7 +210,7 @@ class WarmupManager:
 
         try:
             # Create and add queue
-            queue = self._create_queue(f"q_{self.WARMUP_CAMERA_ID}_{branch_name}", buffer_size)
+            queue = self._create_queue(buffer_size=buffer_size)
             self._warmup_bin.add(queue)
 
             # Request tee src pad and link to queue

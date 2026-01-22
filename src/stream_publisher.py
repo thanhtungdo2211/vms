@@ -66,7 +66,6 @@ class StreamPublisher:
         self.branches = branches
         self.camera_manager = camera_manager
         self._lock = threading.Lock()
-        self._counter = 0
         self._publishers: dict[Tuple[str, str], PublishInfo] = {}
         self._demux_cache: dict[str, Gst.Element] = {}
 
@@ -194,7 +193,7 @@ class StreamPublisher:
 
         return result
 
-    def _create_stream_chain(self, prefix: str, uri: str, bitrate: int) -> list:
+    def _create_stream_chain(self, uri: str, bitrate: int) -> list:
         """Create SRT sink element chain with OSD for per-camera streaming.
 
         Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter → encoder → h264parse → mpegtsmux → srtsink
@@ -203,7 +202,7 @@ class StreamPublisher:
         elements = []
 
         # Queue - buffering for timing variations
-        queue = make_element("queue", f"{prefix}_q", {
+        queue = make_element("queue", None, {
             "max-size-buffers": 60,
             "max-size-time": 2 * Gst.SECOND,
             "leaky": 2
@@ -212,7 +211,7 @@ class StreamPublisher:
 
         # OSD - draw annotations
         try:
-            osd = make_element("nvdsosd", f"{prefix}_osd", {
+            osd = make_element("nvdsosd", None, {
                 "process-mode": 1,
                 "display-text": 1
             })
@@ -222,31 +221,31 @@ class StreamPublisher:
 
         # Video converter - platform-optimized settings
         try:
-            conv = make_element("nvvideoconvert", f"{prefix}_conv", get_nvvidconv_props())
+            conv = make_element("nvvideoconvert", None, get_nvvidconv_props())
         except RuntimeError:
-            conv = make_element("videoconvert", f"{prefix}_conv")
+            conv = make_element("videoconvert", None)
         elements.append(conv)
 
         # Caps filter - encoder needs I420 format
-        caps = make_element("capsfilter", f"{prefix}_caps", {
+        caps = make_element("capsfilter", None, {
             "caps": Gst.Caps.from_string("video/x-raw,format=I420")
         })
         elements.append(caps)
 
         # H264 encoder - platform-optimized
-        enc_factory, enc_name, enc_props = get_encoder_element(prefix, bitrate)
-        enc = make_element(enc_factory, enc_name, enc_props)
+        enc_factory, enc_props = get_encoder_element(bitrate)
+        enc = make_element(enc_factory, None, enc_props)
         elements.append(enc)
         logger.info(f"[StreamPublisher] Using encoder: {enc_factory} ({platform.name})")
 
         # H264 parser
-        parse = make_element("h264parse", f"{prefix}_parse", {
+        parse = make_element("h264parse", None, {
             "config-interval": -1
         })
         elements.append(parse)
 
         # MPEG-TS muxer (SRT typically uses MPEG-TS container)
-        mux = make_element("mpegtsmux", f"{prefix}_mux", {
+        mux = make_element("mpegtsmux", None, {
             "alignment": 7  # Align to 188*7 = 1316 bytes (SRT packet size)
         })
         elements.append(mux)
@@ -261,7 +260,7 @@ class StreamPublisher:
         if "streamid" in srt_params:
             sink_props["streamid"] = srt_params["streamid"]
 
-        sink = make_element("srtsink", f"{prefix}_sink", sink_props)
+        sink = make_element("srtsink", None, sink_props)
         elements.append(sink)
 
         return elements
@@ -299,11 +298,8 @@ class StreamPublisher:
 
             elements = []
             try:
-                self._counter += 1
-                prefix = f"stream_{camera_id}_{self._counter}"
-
                 # Create and add elements
-                elements = self._create_stream_chain(prefix, uri, bitrate)
+                elements = self._create_stream_chain(uri, bitrate)
                 for elem in elements:
                     self.pipeline.add(elem)
 

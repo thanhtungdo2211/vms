@@ -42,21 +42,19 @@ def detect_platform() -> PlatformInfo:
     return PlatformInfo(False, "dgpu", 3, "", 1)
 
 
-def get_encoder_element(prefix: str, bitrate: int) -> Tuple[str, str, dict]:
-    """Get encoder (factory, name, props). Hardware first, fallback x264enc."""
+def get_encoder_element(bitrate: int) -> Tuple[str, dict]:
+    """Get encoder (factory, props). Hardware first, fallback x264enc."""
     platform = detect_platform()
 
     if platform.hw_encoder and Gst.ElementFactory.find(platform.hw_encoder):
         return (
             platform.hw_encoder,
-            f"{prefix}_enc",
             {"bitrate": bitrate, "preset-level": 1, "iframeinterval": 30,
              "control-rate": 1, "maxperf-enable": True}
         )
 
     return (
         "x264enc",
-        f"{prefix}_enc",
         {"bitrate": bitrate // 1000, "speed-preset": "ultrafast",
          "tune": "zerolatency", "threads": 4, "bframes": 0, "key-int-max": 30}
     )
@@ -85,7 +83,7 @@ def load_config(path: str) -> dict:
 # GStreamer Element Factory
 # =============================================================================
 
-def make_element(factory: str, name: str, props: dict = None) -> Gst.Element:
+def make_element(factory: str, name: Optional[str], props: dict = None) -> Gst.Element:
     """Create GStreamer element with properties (thread-safe)."""
     with _gst_lock:
         elem = Gst.ElementFactory.make(factory, name)

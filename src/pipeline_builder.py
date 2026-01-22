@@ -234,9 +234,15 @@ class PipelineBuilder:
                 break
 
     def _create_element(self, cfg: dict, prefix: str) -> Gst.Element:
-        """Create GStreamer element from config."""
+        """Create GStreamer element from config.
+
+        Uses None (auto-naming) by default. Set 'name' in config for explicit naming.
+        """
         elem_type = cfg["type"]
-        name = f"{prefix}_{cfg.get('name', elem_type)}"
+
+        # Use explicit name from config, otherwise None (auto-naming)
+        name = f"{prefix}_{cfg['name']}" if "name" in cfg else None
+
         props = cfg.get("properties", {})
 
         # Handle caps specially
