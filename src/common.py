@@ -10,6 +10,7 @@ This module consolidates:
 import ctypes
 import os
 import re
+import threading
 import time
 from typing import Callable, Iterator, Optional, Tuple
 
@@ -19,6 +20,9 @@ import yaml
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
+
+# Global lock for GStreamer element operations (thread safety)
+_gst_lock = threading.Lock()
 
 
 # =============================================================================
@@ -43,7 +47,7 @@ def load_config(path: str) -> dict:
 # =============================================================================
 
 def make_element(factory: str, name: str, props: dict = None) -> Gst.Element:
-    """Create GStreamer element with properties.
+    """Create GStreamer element with properties (thread-safe).
 
     Args:
         factory: Element factory name (e.g., "queue", "nvvideoconvert")
@@ -62,12 +66,13 @@ def make_element(factory: str, name: str, props: dict = None) -> Gst.Element:
             "leaky": 2
         })
     """
-    elem = Gst.ElementFactory.make(factory, name)
-    if not elem:
-        raise RuntimeError(f"Cannot create element: {factory}")
-    for k, v in (props or {}).items():
-        elem.set_property(k.replace("-", "_"), v)
-    return elem
+    with _gst_lock:
+        elem = Gst.ElementFactory.make(factory, name)
+        if not elem:
+            raise RuntimeError(f"Cannot create element: {factory}")
+        for k, v in (props or {}).items():
+            elem.set_property(k.replace("-", "_"), v)
+        return elem
 
 
 # =============================================================================

@@ -1,12 +1,15 @@
-"""Demux RTSP Publisher - Stream individual cameras WITH annotations.
+"""Stream Publisher - Stream individual cameras WITH annotations via SRT.
 
 Uses nvstreamdemux to split batched frames to individual streams.
 Each camera gets its own OSD element for drawing annotations.
 
 Architecture:
-    Muxer → PGIE → Tracker → SGIE → nvstreamdemux → src_0 → OSD → enc → RTSP (cam0)
-                                                  → src_1 → OSD → enc → RTSP (cam1)
+    Muxer → PGIE → Tracker → SGIE → nvstreamdemux → src_0 → OSD → enc → SRT (cam0)
+                                                  → src_1 → OSD → enc → SRT (cam1)
                                                   → src_N ...
+
+SRT URL Format:
+    srt://host:port?streamid=publish:stream_name&pkt_size=1316
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 # Third-party
 import gi
@@ -37,11 +41,11 @@ STATE_CHANGE_TIMEOUT = 5 * Gst.SECOND
 
 
 @dataclass
-class DemuxPublishInfo:
-    """Info about active demux RTSP publish session."""
+class PublishInfo:
+    """Info about active stream publish session."""
     camera_id: str
     branch: str
-    location: str
+    uri: str
     bitrate: int
     started_at: datetime
     source_id: int
@@ -49,8 +53,8 @@ class DemuxPublishInfo:
     demux_pad: Optional[Gst.Pad] = None
 
 
-class DemuxRtspPublisher:
-    """Manage per-camera RTSP streaming with annotations via nvstreamdemux."""
+class StreamPublisher:
+    """Manage per-camera SRT streaming with annotations via nvstreamdemux."""
 
     def __init__(
         self,
@@ -63,7 +67,7 @@ class DemuxRtspPublisher:
         self.camera_manager = camera_manager
         self._lock = threading.Lock()
         self._counter = 0
-        self._publishers: dict[Tuple[str, str], DemuxPublishInfo] = {}
+        self._publishers: dict[Tuple[str, str], PublishInfo] = {}
         self._demux_cache: dict[str, Gst.Element] = {}
 
         # Pre-request pads on all demux elements (must be in NULL state)
@@ -83,14 +87,14 @@ class DemuxRtspPublisher:
                 pad_name = f"src_{i}"
                 pad = demux.request_pad_simple(pad_name)
                 if pad:
-                    logger.info(f"[DemuxRTSP] Pre-requested {branch_name}/{pad_name}")
+                    logger.info(f"[StreamPublisher] Pre-requested {branch_name}/{pad_name}")
                 else:
-                    logger.warning(f"[DemuxRTSP] Failed to pre-request {branch_name}/{pad_name}")
+                    logger.warning(f"[StreamPublisher] Failed to pre-request {branch_name}/{pad_name}")
 
     def reset(self):
         """Reset state after pipeline NULL. Re-request pads when returning to READY."""
         with self._lock:
-            logger.info("[DemuxRTSP] Resetting state")
+            logger.info("[StreamPublisher] Resetting state")
             self._publishers.clear()
             self._demux_cache.clear()
             self._setup_demux_handlers()
@@ -122,7 +126,7 @@ class DemuxRtspPublisher:
         for elem in elements:
             ret = elem.set_state(state)
             if ret == Gst.StateChangeReturn.FAILURE:
-                logger.warning(f"[DemuxRTSP] {elem.get_name()} failed -> {state.value_nick}")
+                logger.warning(f"[StreamPublisher] {elem.get_name()} failed -> {state.value_nick}")
                 success = False
             if wait:
                 elem.get_state(STATE_CHANGE_TIMEOUT)
@@ -139,48 +143,62 @@ class DemuxRtspPublisher:
             if result == Gst.IteratorResult.DONE:
                 break
             if result == Gst.IteratorResult.OK and pad.get_name() == pad_name:
-                logger.info(f"[DemuxRTSP] Found existing pad {pad_name}")
+                logger.info(f"[StreamPublisher] Found existing pad {pad_name}")
                 return pad
 
         # Request pad if not found
         pad = demux.request_pad_simple(pad_name)
         if pad:
-            logger.info(f"[DemuxRTSP] Requested pad {pad_name}")
+            logger.info(f"[StreamPublisher] Requested pad {pad_name}")
         else:
-            logger.warning(f"[DemuxRTSP] Failed to request pad {pad_name}")
+            logger.warning(f"[StreamPublisher] Failed to request pad {pad_name}")
         return pad
 
-    def _link_rtsp_chain(self, elements: list) -> bool:
-        """Link RTSP chain elements. Returns True on success."""
+    def _link_chain(self, elements: list) -> bool:
+        """Link element chain. Returns True on success."""
         for i in range(len(elements) - 1):
             src_elem, dst_elem = elements[i], elements[i + 1]
-
-            # Special handling for rtspclientsink (request pad)
-            if "rtspclientsink" in dst_elem.get_factory().get_name():
-                sink_pad = dst_elem.request_pad_simple("sink_%u")
-                if not sink_pad:
-                    raise RuntimeError("Failed to get rtspclientsink request pad")
-                src_pad = src_elem.get_static_pad("src")
-                if src_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
-                    raise RuntimeError("Failed to link to rtspclientsink")
-            else:
-                if not src_elem.link(dst_elem):
-                    raise RuntimeError(f"Failed to link {src_elem.get_name()}")
+            if not src_elem.link(dst_elem):
+                raise RuntimeError(f"Failed to link {src_elem.get_name()} -> {dst_elem.get_name()}")
         return True
 
-    def _pub_to_dict(self, pub: DemuxPublishInfo) -> dict:
-        """Convert DemuxPublishInfo to status dict."""
+    def _pub_to_dict(self, pub: PublishInfo) -> dict:
+        """Convert PublishInfo to status dict."""
         return {
             "publishing": True,
             "annotated": True,
-            "location": pub.location,
+            "uri": pub.uri,
             "bitrate": pub.bitrate,
             "source_id": pub.source_id,
             "started_at": pub.started_at.isoformat()
         }
 
-    def _create_rtsp_chain(self, prefix: str, location: str, bitrate: int) -> list:
-        """Create RTSP sink element chain with OSD for per-camera streaming."""
+    def _parse_srt_uri(self, uri: str) -> dict:
+        """Parse SRT URI and extract streamid from query params.
+
+        srtsink requires streamid as separate property, not in URI.
+        Input:  srt://host:port?streamid=publish:name&pkt_size=1316
+        Output: {"uri": "srt://host:port", "streamid": "publish:name"}
+        """
+        parsed = urlparse(uri)
+        query = parse_qs(parsed.query)
+
+        # Build clean URI without query params
+        clean_uri = f"srt://{parsed.hostname}:{parsed.port or 8890}"
+
+        result = {"uri": clean_uri}
+
+        # Extract streamid if present
+        if "streamid" in query:
+            result["streamid"] = query["streamid"][0]
+
+        return result
+
+    def _create_stream_chain(self, prefix: str, uri: str, bitrate: int) -> list:
+        """Create SRT sink element chain with OSD for per-camera streaming.
+
+        Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter → x264enc → h264parse → mpegtsmux → srtsink
+        """
         elements = []
 
         # Queue - buffering for timing variations
@@ -199,7 +217,7 @@ class DemuxRtspPublisher:
             })
             elements.append(osd)
         except RuntimeError:
-            logger.warning("[DemuxRTSP] nvdsosd not available, skipping OSD")
+            logger.warning("[StreamPublisher] nvdsosd not available, skipping OSD")
 
         # Video converter - output to system memory
         try:
@@ -234,14 +252,23 @@ class DemuxRtspPublisher:
         })
         elements.append(parse)
 
-        # RTSP client sink
-        sink = make_element("rtspclientsink", f"{prefix}_sink", {
-            "location": location,
-            "protocols": 4,
-            "latency": 200,
-            "do-rtsp-keep-alive": True,
-            "timeout": 5000000
+        # MPEG-TS muxer (SRT typically uses MPEG-TS container)
+        mux = make_element("mpegtsmux", f"{prefix}_mux", {
+            "alignment": 7  # Align to 188*7 = 1316 bytes (SRT packet size)
         })
+        elements.append(mux)
+
+        # Parse URI and extract streamid
+        srt_params = self._parse_srt_uri(uri)
+        sink_props = {
+            "uri": srt_params["uri"],
+            "wait-for-connection": False,
+            "sync": False
+        }
+        if "streamid" in srt_params:
+            sink_props["streamid"] = srt_params["streamid"]
+
+        sink = make_element("srtsink", f"{prefix}_sink", sink_props)
         elements.append(sink)
 
         return elements
@@ -250,45 +277,45 @@ class DemuxRtspPublisher:
         self,
         camera_id: str,
         branch_name: str,
-        location: str,
+        uri: str,
         bitrate: int = 4000000
     ) -> bool:
-        """Start RTSP publishing for specific camera with annotations."""
-        if not location.startswith("rtsp://"):
-            logger.error(f"[DemuxRTSP] Invalid RTSP URL: {location}")
+        """Start SRT publishing for specific camera with annotations."""
+        if not uri.startswith("srt://"):
+            logger.error(f"[StreamPublisher] Invalid SRT URL: {uri}")
             return False
 
         with self._lock:
             key = (camera_id, branch_name)
 
             if key in self._publishers:
-                logger.warning(f"[DemuxRTSP] {camera_id}/{branch_name} already publishing")
+                logger.warning(f"[StreamPublisher] {camera_id}/{branch_name} already publishing")
                 return True
 
             # Validate camera exists
             cam = self.camera_manager.get_camera(camera_id)
             if not cam:
-                logger.error(f"[DemuxRTSP] Camera {camera_id} not found")
+                logger.error(f"[StreamPublisher] Camera {camera_id} not found")
                 return False
 
             # Get demux element
             demux = self._get_demux(branch_name)
             if not demux:
-                logger.error(f"[DemuxRTSP] No nvstreamdemux in branch {branch_name}")
+                logger.error(f"[StreamPublisher] No nvstreamdemux in branch {branch_name}")
                 return False
 
             elements = []
             try:
                 self._counter += 1
-                prefix = f"demux_rtsp_{camera_id}_{self._counter}"
+                prefix = f"stream_{camera_id}_{self._counter}"
 
                 # Create and add elements
-                elements = self._create_rtsp_chain(prefix, location, bitrate)
+                elements = self._create_stream_chain(prefix, uri, bitrate)
                 for elem in elements:
                     self.pipeline.add(elem)
 
-                # Link RTSP chain
-                self._link_rtsp_chain(elements)
+                # Link stream chain
+                self._link_chain(elements)
 
                 # Get demux pad
                 demux_src = self._get_demux_pad(demux, cam.source_id)
@@ -299,7 +326,7 @@ class DemuxRtspPublisher:
 
                 # State transitions BEFORE linking to demux
                 _, pipeline_state, _ = self.pipeline.get_state(0)
-                logger.info(f"[DemuxRTSP] Pipeline: {pipeline_state}, transitioning elements...")
+                logger.info(f"[StreamPublisher] Pipeline: {pipeline_state}, transitioning elements...")
 
                 # READY -> PAUSED -> link -> PLAYING
                 self._set_elements_state(elements, Gst.State.READY)
@@ -311,7 +338,7 @@ class DemuxRtspPublisher:
                 link_result = demux_src.link(queue_sink)
                 if link_result != Gst.PadLinkReturn.OK:
                     raise RuntimeError(f"Failed to link demux pad: {link_result}")
-                logger.info(f"[DemuxRTSP] Linked src_{cam.source_id} to RTSP chain")
+                logger.info(f"[StreamPublisher] Linked src_{cam.source_id} to stream chain")
 
                 # Transition to PLAYING
                 time.sleep(0.2)
@@ -320,10 +347,10 @@ class DemuxRtspPublisher:
                 time.sleep(0.3)
 
                 # Store publish info
-                self._publishers[key] = DemuxPublishInfo(
+                self._publishers[key] = PublishInfo(
                     camera_id=camera_id,
                     branch=branch_name,
-                    location=location,
+                    uri=uri,
                     bitrate=bitrate,
                     started_at=datetime.now(),
                     source_id=cam.source_id,
@@ -331,11 +358,11 @@ class DemuxRtspPublisher:
                     demux_pad=demux_src
                 )
 
-                logger.info(f"[DemuxRTSP] Started {camera_id}/{branch_name} (src_{cam.source_id}) → {location}")
+                logger.info(f"[StreamPublisher] Started {camera_id}/{branch_name} (src_{cam.source_id}) → {uri}")
                 return True
 
             except Exception as e:
-                logger.error(f"[DemuxRTSP] Failed to start publish: {e}", exc_info=True)
+                logger.error(f"[StreamPublisher] Failed to start publish: {e}", exc_info=True)
                 self._cleanup_elements(elements)
                 return False
 
@@ -349,13 +376,13 @@ class DemuxRtspPublisher:
                 pass
 
     def stop_publish(self, camera_id: str, branch_name: str) -> bool:
-        """Stop RTSP publishing for specific camera using blocking probe."""
+        """Stop SRT publishing for specific camera using blocking probe."""
         with self._lock:
             key = (camera_id, branch_name)
             pub = self._publishers.get(key)
 
             if not pub:
-                logger.warning(f"[DemuxRTSP] {camera_id}/{branch_name} not publishing")
+                logger.warning(f"[StreamPublisher] {camera_id}/{branch_name} not publishing")
                 return False
 
             probe_id = None
@@ -373,14 +400,14 @@ class DemuxRtspPublisher:
 
                     probe_id = demux_pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, block_probe)
                     if not blocked.wait(timeout=2.0):
-                        logger.warning(f"[DemuxRTSP] Block probe timeout for {camera_id}/{branch_name}")
+                        logger.warning(f"[StreamPublisher] Block probe timeout for {camera_id}/{branch_name}")
 
                 # Unlink demux from queue
                 if demux_pad and elements:
                     queue_sink = elements[0].get_static_pad("sink")
                     if queue_sink and queue_sink.is_linked():
                         demux_pad.unlink(queue_sink)
-                        logger.info(f"[DemuxRTSP] Unlinked demux pad for {camera_id}/{branch_name}")
+                        logger.info(f"[StreamPublisher] Unlinked demux pad for {camera_id}/{branch_name}")
 
                 # Remove blocking probe
                 if demux_pad and probe_id is not None:
@@ -396,11 +423,11 @@ class DemuxRtspPublisher:
                     self.pipeline.remove(elem)
 
                 del self._publishers[key]
-                logger.info(f"[DemuxRTSP] Stopped {camera_id}/{branch_name}")
+                logger.info(f"[StreamPublisher] Stopped {camera_id}/{branch_name}")
                 return True
 
             except Exception as e:
-                logger.error(f"[DemuxRTSP] Failed to stop publish: {e}", exc_info=True)
+                logger.error(f"[StreamPublisher] Failed to stop publish: {e}", exc_info=True)
                 if probe_id is not None and pub.demux_pad:
                     try:
                         pub.demux_pad.remove_probe(probe_id)
@@ -413,7 +440,7 @@ class DemuxRtspPublisher:
         camera_id: Optional[str] = None,
         branch_name: Optional[str] = None
     ) -> dict:
-        """Get RTSP publishing status."""
+        """Get SRT publishing status."""
         with self._lock:
             # Single camera/branch query
             if camera_id and branch_name:
@@ -441,4 +468,4 @@ class DemuxRtspPublisher:
             try:
                 self.stop_publish(key[0], key[1])
             except Exception as e:
-                logger.warning(f"[DemuxRTSP] Cleanup error for {key}: {e}")
+                logger.warning(f"[StreamPublisher] Cleanup error for {key}: {e}")

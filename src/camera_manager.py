@@ -44,11 +44,11 @@ class MultibranchCameraManager:
         self._mapper = SourceIDMapper()
         self._lock = threading.Lock()
         self._last_op = 0.0
-        self._rtsp_publisher = None
+        self._stream_publisher = None
 
-    def set_rtsp_publisher(self, publisher) -> None:
-        """Set the RTSP publisher for cleanup on camera removal."""
-        self._rtsp_publisher = publisher
+    def set_stream_publisher(self, publisher) -> None:
+        """Set the stream publisher for cleanup on camera removal."""
+        self._stream_publisher = publisher
 
     # ─────────────────────────────────────────────────────────────────────────
     # State Management
@@ -365,8 +365,8 @@ class MultibranchCameraManager:
             try:
                 logger.info(f"[CAM] Removing {camera_id}...")
 
-                if self._rtsp_publisher:
-                    self._rtsp_publisher.cleanup_camera(camera_id)
+                if self._stream_publisher:
+                    self._stream_publisher.cleanup_camera(camera_id)
 
                 # Block data flow
                 for pad in cam.branch_pads.values():

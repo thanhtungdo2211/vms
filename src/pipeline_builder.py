@@ -62,7 +62,7 @@ class PipelineBuilder:
 
         # Runtime components (created during start_api)
         self._camera_manager = None
-        self._rtsp_publisher = None
+        self._stream_publisher = None
         self._api_server = None
 
         if processors:
@@ -338,21 +338,21 @@ class PipelineBuilder:
         Must be called AFTER build() but BEFORE set_ready_and_warmup().
         Creates:
         - MultibranchCameraManager for dynamic camera control
-        - DemuxRtspPublisher for per-camera RTSP streams
+        - StreamPublisher for per-camera SRT streams
         - CameraAPIServer for REST API
         """
         from src.camera_manager import MultibranchCameraManager
-        from src.demux_rtsp_publisher import DemuxRtspPublisher
+        from src.stream_publisher import StreamPublisher
         from src.api.camera_api import CameraAPIServer
 
         # Create camera manager
         self._camera_manager = MultibranchCameraManager(self.pipeline, self.branches)
 
-        # Create RTSP publisher (MUST be before READY state - needs NULL state pads)
-        self._rtsp_publisher = DemuxRtspPublisher(
+        # Create SRT publisher (MUST be before READY state - needs NULL state pads)
+        self._stream_publisher = StreamPublisher(
             self.pipeline, self.branches, self._camera_manager
         )
-        logger.info("RTSP publisher created (per-camera annotated streams)")
+        logger.info("Stream publisher created (per-camera annotated streams)")
 
         # Set READY and warmup
         if not self.set_ready_and_warmup():
@@ -365,7 +365,7 @@ class PipelineBuilder:
         self._api_server = CameraAPIServer(
             self.config.get("camera_api", {}),
             self._camera_manager,
-            demux_rtsp_publisher=self._rtsp_publisher
+            stream_publisher=self._stream_publisher
         )
         self._api_server.start()
 
@@ -398,9 +398,9 @@ class PipelineBuilder:
         return self._camera_manager
 
     @property
-    def rtsp_publisher(self):
-        """Access RTSP publisher (available after start_api)."""
-        return self._rtsp_publisher
+    def stream_publisher(self):
+        """Access stream publisher (available after start_api)."""
+        return self._stream_publisher
 
     @property
     def api_server(self):
