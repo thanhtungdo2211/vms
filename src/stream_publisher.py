@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from src.pipeline_builder import BranchInfo
     from src.camera_manager import MultibranchCameraManager
 
-from src.common import make_element
+from src.common import make_element, detect_platform, get_encoder_element, get_nvvidconv_props
 
 logger = logging.getLogger(__name__)
 
@@ -197,8 +197,9 @@ class StreamPublisher:
     def _create_stream_chain(self, prefix: str, uri: str, bitrate: int) -> list:
         """Create SRT sink element chain with OSD for per-camera streaming.
 
-        Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter → x264enc → h264parse → mpegtsmux → srtsink
+        Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter → encoder → h264parse → mpegtsmux → srtsink
         """
+        platform = detect_platform()
         elements = []
 
         # Queue - buffering for timing variations
@@ -219,32 +220,24 @@ class StreamPublisher:
         except RuntimeError:
             logger.warning("[StreamPublisher] nvdsosd not available, skipping OSD")
 
-        # Video converter - output to system memory
+        # Video converter - platform-optimized settings
         try:
-            conv = make_element("nvvideoconvert", f"{prefix}_conv", {
-                "compute-hw": 1,
-                "nvbuf-memory-type": 3
-            })
+            conv = make_element("nvvideoconvert", f"{prefix}_conv", get_nvvidconv_props())
         except RuntimeError:
             conv = make_element("videoconvert", f"{prefix}_conv")
         elements.append(conv)
 
-        # Caps filter - x264enc needs I420 format
+        # Caps filter - encoder needs I420 format
         caps = make_element("capsfilter", f"{prefix}_caps", {
             "caps": Gst.Caps.from_string("video/x-raw,format=I420")
         })
         elements.append(caps)
 
-        # H264 encoder
-        enc = make_element("x264enc", f"{prefix}_enc", {
-            "bitrate": bitrate // 1000,
-            "speed-preset": "ultrafast",
-            "tune": "zerolatency",
-            "threads": 4,
-            "bframes": 0,
-            "key-int-max": 30
-        })
+        # H264 encoder - platform-optimized
+        enc_factory, enc_name, enc_props = get_encoder_element(prefix, bitrate)
+        enc = make_element(enc_factory, enc_name, enc_props)
         elements.append(enc)
+        logger.info(f"[StreamPublisher] Using encoder: {enc_factory} ({platform.name})")
 
         # H264 parser
         parse = make_element("h264parse", f"{prefix}_parse", {

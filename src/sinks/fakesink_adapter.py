@@ -5,6 +5,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
 from src.sinks.base_sink import BaseSink
+from src.common import get_nvvidconv_props
 
 
 class FakesinkAdapter(BaseSink):
@@ -23,10 +24,7 @@ class FakesinkAdapter(BaseSink):
 
         chain = [
             self._make("queue", f"{p}_q", {"max-size-buffers": 30, "leaky": 2}),
-            self._make("nvvideoconvert", f"{p}_nv", {"compute-hw": 1, "nvbuf-memory-type": 3}),
-            # self._make("capsfilter", f"{p}_caps", {"caps": Gst.Caps.from_string("video/x-raw,format=RGBA")}),
-            # self._make("videoconvert", f"{p}_vc"),
-            # self._make("queue", f"{p}_q2", {"max-size-buffers": 30, "leaky": 2}),
+            self._make("nvvideoconvert", f"{p}_nv", get_nvvidconv_props()),
             self._make("fakesink", f"{p}_sink", {"sync": False, "async": False, "qos": False}),
         ]
 

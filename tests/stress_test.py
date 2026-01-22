@@ -110,7 +110,7 @@ def make_srt_uri(cam_id: str, branch: str) -> str:
     return f"srt://{SRT_SERVER}:{SRT_PORT}?streamid={stream_id}&pkt_size=1316"
 
 
-def start_srt(cam_id: str, branch: str, bitrate: int = 4000000) -> bool:
+def start_srt(cam_id: str, branch: str, bitrate: int = 1000000) -> bool:
     """Start SRT publishing for camera/branch."""
     uri = make_srt_uri(cam_id, branch)
     r = api("POST", f"/api/cameras/{cam_id}/branches/{branch}/srt/start", {

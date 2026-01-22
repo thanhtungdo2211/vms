@@ -2,6 +2,7 @@
 Common utilities for DeepStream pipeline.
 
 This module consolidates:
+- Platform detection (T4/Jetson)
 - Config loading with environment variable expansion
 - DeepStream metadata extractors
 - FPS monitoring and interval utilities
@@ -12,6 +13,8 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable, Iterator, Optional, Tuple
 
 import numpy as np
@@ -23,6 +26,100 @@ from gi.repository import Gst, GLib
 
 # Global lock for GStreamer element operations (thread safety)
 _gst_lock = threading.Lock()
+
+
+# =============================================================================
+# Platform Detection
+# =============================================================================
+
+@dataclass
+class PlatformInfo:
+    """Platform-specific configuration for DeepStream."""
+    is_jetson: bool
+    name: str
+    # Memory types: 0=DEFAULT, 1=CUDA_PINNED, 2=CUDA_DEVICE, 3=CUDA_UNIFIED, 4=SURFACE_ARRAY
+    nvbuf_memory_type: int
+    # Hardware encoder available
+    hw_encoder: str  # "nvv4l2h264enc" for Jetson, "" for dGPU (use x264enc)
+    # Compute hardware for nvvideoconvert
+    compute_hw: int  # 0=CPU, 1=GPU, 2=VIC (Jetson only)
+
+
+@lru_cache(maxsize=1)
+def detect_platform() -> PlatformInfo:
+    """Detect running platform (Jetson vs dGPU).
+
+    Returns PlatformInfo with optimal settings for the platform.
+    """
+    is_jetson = os.path.exists("/etc/nv_tegra_release") or os.path.exists("/proc/device-tree/model")
+
+    if is_jetson:
+        # Jetson: Use NVBUF_MEM_DEFAULT (0), VIC for compute, hardware encoder
+        return PlatformInfo(
+            is_jetson=True,
+            name="jetson",
+            nvbuf_memory_type=0,  # DEFAULT - let system decide
+            hw_encoder="nvv4l2h264enc",
+            compute_hw=2  # VIC - Video Image Compositor
+        )
+    else:
+        # dGPU (T4, etc): Use NVBUF_MEM_CUDA_UNIFIED (3), GPU compute
+        return PlatformInfo(
+            is_jetson=False,
+            name="dgpu",
+            nvbuf_memory_type=3,  # CUDA_UNIFIED
+            hw_encoder="",  # Use x264enc, nvenc not always available
+            compute_hw=1  # GPU
+        )
+
+
+def get_encoder_element(prefix: str, bitrate: int) -> Tuple[str, str, dict]:
+    """Get optimal encoder for platform with automatic fallback.
+
+    Returns: (factory_name, element_name, properties)
+    Tries hardware encoder first, falls back to x264enc if unavailable.
+    """
+    platform = detect_platform()
+
+    # Try hardware encoder on Jetson
+    if platform.hw_encoder:
+        # Check if hardware encoder is available
+        factory = Gst.ElementFactory.find(platform.hw_encoder)
+        if factory:
+            return (
+                platform.hw_encoder,
+                f"{prefix}_enc",
+                {
+                    "bitrate": bitrate,
+                    "preset-level": 1,  # UltraFast
+                    "iframeinterval": 30,
+                    "control-rate": 1,  # CBR
+                    "maxperf-enable": True
+                }
+            )
+
+    # Fallback: x264enc (software)
+    return (
+        "x264enc",
+        f"{prefix}_enc",
+        {
+            "bitrate": bitrate // 1000,  # x264 uses kbps
+            "speed-preset": "ultrafast",
+            "tune": "zerolatency",
+            "threads": 4,
+            "bframes": 0,
+            "key-int-max": 30
+        }
+    )
+
+
+def get_nvvidconv_props() -> dict:
+    """Get platform-optimal nvvideoconvert properties."""
+    platform = detect_platform()
+    return {
+        "compute-hw": platform.compute_hw,
+        "nvbuf-memory-type": platform.nvbuf_memory_type
+    }
 
 
 # =============================================================================
