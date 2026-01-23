@@ -77,17 +77,6 @@ class MultibranchCameraManager:
                 logger.debug(f"[CAM] {name} set to {state_name}")
         return True
 
-    def _pause_pipeline(self) -> bool:
-        """Pause pipeline for safe topology change."""
-        logger.info("[CAM] Pausing pipeline for safe operation")
-        self.pipeline.set_state(Gst.State.PAUSED)
-        ret, _, _ = self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            logger.error("[CAM] Failed to pause pipeline")
-            return False
-        time.sleep(0.5)
-        return True
-
     def _resume_pipeline(self) -> bool:
         """Resume pipeline to PLAYING state."""
         logger.info("[CAM] Resuming pipeline to PLAYING")
@@ -506,7 +495,10 @@ class MultibranchCameraManager:
                 return False
 
     def remove_camera_from_branch(self, camera_id: str, branch_name: str) -> bool:
-        """Remove camera from branch."""
+        """
+        Remove camera from branch without pausing pipeline.
+        Uses blocking probe for safe unlinking even when branch becomes empty.
+        """
         with self._lock:
             self._delay()
             cam = self._cameras.get(camera_id)
@@ -515,20 +507,10 @@ class MultibranchCameraManager:
 
             logger.info(f"[CAM] Removing {camera_id} from {branch_name}")
 
-            # Count cameras in this branch from synced dict
-            branch_cam_count = sum(1 for c in self._cameras.values() if branch_name in c.branch_pads)
-            will_empty = branch_cam_count <= 1
-
-            _, prev_state, _ = self.pipeline.get_state(0)
-
             try:
-                if will_empty and prev_state == Gst.State.PLAYING:
-                    self._pause_pipeline()
-
+                # Unlink using blocking probe - safe even if branch becomes empty
+                # No need to pause pipeline as blocking probe handles data flow
                 self._unlink_branch(cam, branch_name, camera_id, use_blocking=True)
-
-                if will_empty and prev_state == Gst.State.PLAYING:
-                    self._resume_pipeline()
 
                 self._last_op = time.time()
                 logger.info(f"[CAM] Removed {camera_id} from {branch_name}")
@@ -536,8 +518,6 @@ class MultibranchCameraManager:
 
             except Exception as e:
                 logger.error(f"remove_camera_from_branch failed: {e}", exc_info=True)
-                if will_empty and prev_state == Gst.State.PLAYING:
-                    self.pipeline.set_state(Gst.State.PLAYING)
                 return False
 
     def kill_all(self) -> int:
