@@ -118,18 +118,6 @@ class StreamPublisher:
             self._demux_cache[branch_name] = demux
         return demux
 
-    def _set_elements_state(self, elements: list, state: Gst.State, wait: bool = True) -> bool:
-        """Set all elements to target state. Returns False if any failed."""
-        success = True
-        for elem in elements:
-            ret = elem.set_state(state)
-            if ret == Gst.StateChangeReturn.FAILURE:
-                logger.warning(f"[StreamPublisher] {elem.get_name()} failed -> {state.value_nick}")
-                success = False
-            if wait:
-                elem.get_state(STATE_CHANGE_TIMEOUT)
-        return success
-
     def _get_demux_pad(self, demux: Gst.Element, source_id: int) -> Optional[Gst.Pad]:
         """Get demux src pad by source_id (iterate first, then request)."""
         pad_name = f"src_{source_id}"
@@ -171,13 +159,8 @@ class StreamPublisher:
         platform = detect_platform()
         elements = []
 
-        # Queue - leaky mode to prevent buffer accumulation on slow consumers
-        queue = make_element("queue", None, {
-            # "max-size-buffers": 3,
-            # "max-size-bytes": 0,
-            # "max-size-time": 0,
-            # "leaky": 2  # downstream - drop oldest buffers
-        })
+        # Queue
+        queue = make_element("queue", None)
         elements.append(queue)
 
         # OSD - draw annotations (CPU mode on Jetson to avoid GPU memory pressure)
@@ -192,16 +175,6 @@ class StreamPublisher:
             conv_props['copy-hw'] = 2
         conv = make_element("nvvideoconvert", None, conv_props)
         elements.append(conv)
-
-        # Queue after converter - isolate buffers from inference pipeline (critical for Jetson)
-        # if platform.is_jetson:
-        #     queue2 = make_element("queue", None, {
-        #         "max-size-buffers": 2,
-        #         "max-size-bytes": 0,
-        #         "max-size-time": 0,
-        #         "leaky": 2
-        #     })
-        #     elements.append(queue2)
 
         # Caps filter - encoder needs I420 format
         caps = make_element("capsfilter", None, {
@@ -274,17 +247,12 @@ class StreamPublisher:
                 return False
 
             elements = []
-            prev_state = Gst.State.NULL
             try:
-                # Get pipeline state and pause for safe topology change
+                # Get pipeline state
                 _, prev_state, _ = self.pipeline.get_state(0)
-                if prev_state == Gst.State.PLAYING:
-                    logger.info(f"[StreamPublisher] Pausing pipeline for RTSP setup")
-                    self.pipeline.set_state(Gst.State.PAUSED)
-                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
-                    time.sleep(0.3)
+                logger.info(f"[StreamPublisher] Adding RTSP stream (pipeline: {prev_state.value_nick})")
 
-                # Create and add elements
+                # Create and add elements to pipeline
                 elements = self._create_stream_chain(uri, bitrate)
                 for elem in elements:
                     self.pipeline.add(elem)
@@ -320,24 +288,12 @@ class StreamPublisher:
                     raise RuntimeError(f"Failed to link demux pad: {link_result}")
                 logger.info(f"[StreamPublisher] Linked src_{cam.source_id} to stream chain")
 
-                # Sync element states with parent
-                logger.info(f"[StreamPublisher] Syncing element states...")
-                for i, elem in enumerate(elements):
-                    ret = elem.sync_state_with_parent()
-                    logger.debug(f"[StreamPublisher] Element {i}/{len(elements)} ({elem.get_name()}): {ret}")
-                logger.info(f"[StreamPublisher] All elements synced")
-
-                # Resume pipeline
-                if prev_state == Gst.State.PLAYING:
-                    logger.info(f"[StreamPublisher] Resuming pipeline to PLAYING...")
-                    ret = self.pipeline.set_state(Gst.State.PLAYING)
-                    if ret == Gst.StateChangeReturn.FAILURE:
-                        raise RuntimeError("Pipeline failed to return to PLAYING state")
-
-                    ret2, state, pending = self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
-                    if ret2 == Gst.StateChangeReturn.FAILURE:
-                        raise RuntimeError(f"Pipeline state change failed (current={state.value_nick}, pending={pending.value_nick})")
-                    logger.info(f"[StreamPublisher] Pipeline resumed to {state.value_nick}")
+                # Sync element states incrementally to pipeline state
+                logger.info(f"[StreamPublisher] Syncing element states to {prev_state.value_nick}...")
+                for elem in elements:
+                    # Sync each element to current pipeline state (NULL->READY->PAUSED->PLAYING)
+                    elem.sync_state_with_parent()
+                logger.info(f"[StreamPublisher] All elements synced to {prev_state.value_nick}")
 
                 # Store publish info
                 self._publishers[key] = PublishInfo(
@@ -357,9 +313,6 @@ class StreamPublisher:
             except Exception as e:
                 logger.error(f"[StreamPublisher] Failed to start publish: {e}", exc_info=True)
                 self._cleanup_elements(elements)
-                # Restore pipeline state
-                if prev_state == Gst.State.PLAYING:
-                    self.pipeline.set_state(Gst.State.PLAYING)
                 return False
 
     def _cleanup_elements(self, elements: list) -> None:
