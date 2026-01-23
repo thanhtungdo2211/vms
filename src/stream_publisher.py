@@ -1,15 +1,15 @@
-"""Stream Publisher - Stream individual cameras WITH annotations via SRT.
+"""Stream Publisher - Stream individual cameras WITH annotations via RTSP.
 
 Uses nvstreamdemux to split batched frames to individual streams.
 Each camera gets its own OSD element for drawing annotations.
 
 Architecture:
-    Muxer → PGIE → Tracker → SGIE → nvstreamdemux → src_0 → OSD → enc → SRT (cam0)
-                                                  → src_1 → OSD → enc → SRT (cam1)
+    Muxer → PGIE → Tracker → SGIE → nvstreamdemux → src_0 → OSD → enc → RTSP (cam0)
+                                                  → src_1 → OSD → enc → RTSP (cam1)
                                                   → src_N ...
 
-SRT URL Format:
-    srt://host:port?streamid=publish:stream_name&pkt_size=1316
+RTSP URL Format:
+    rtsp://host:port/stream_name
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
 
 # Third-party
 import gi
@@ -164,55 +163,45 @@ class StreamPublisher:
             "started_at": pub.started_at.isoformat()
         }
 
-    def _parse_srt_uri(self, uri: str) -> dict:
-        """Parse SRT URI and extract streamid from query params.
-
-        srtsink requires streamid as separate property, not in URI.
-        Input:  srt://host:port?streamid=publish:name&pkt_size=1316
-        Output: {"uri": "srt://host:port", "streamid": "publish:name"}
-        """
-        parsed = urlparse(uri)
-        query = parse_qs(parsed.query)
-
-        # Build clean URI without query params
-        clean_uri = f"srt://{parsed.hostname}:{parsed.port or 8890}"
-
-        result = {"uri": clean_uri}
-
-        # Extract streamid if present
-        if "streamid" in query:
-            result["streamid"] = query["streamid"][0]
-
-        return result
-
     def _create_stream_chain(self, uri: str, bitrate: int) -> list:
-        """Create SRT sink element chain with OSD for per-camera streaming.
+        """Create RTSP sink element chain with OSD for per-camera streaming.
 
-        Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter → encoder → h264parse → mpegtsmux → srtsink
+        Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter → encoder → h264parse → rtspclientsink
         """
         platform = detect_platform()
         elements = []
 
-        # Queue - buffering for timing variations
-        queue = make_element("queue", None, {})
+        # Queue - leaky mode to prevent buffer accumulation on slow consumers
+        queue = make_element("queue", None, {
+            # "max-size-buffers": 3,
+            # "max-size-bytes": 0,
+            # "max-size-time": 0,
+            # "leaky": 2  # downstream - drop oldest buffers
+        })
         elements.append(queue)
 
-        # OSD - draw annotations
-        try:
-            osd = make_element("nvdsosd", None, {
-                "process-mode": 1,
-                "display-text": 1
-            })
-            elements.append(osd)
-        except RuntimeError:
-            logger.warning("[StreamPublisher] nvdsosd not available, skipping OSD")
+        # OSD - draw annotations (CPU mode on Jetson to avoid GPU memory pressure)
+        osd = make_element("nvdsosd", None, {
+            "process-mode": 0 if platform.is_jetson else 1,
+            "display-text": 1
+        })
+        elements.append(osd)
 
-        # Video converter - platform-optimized settings
-        try:
-            conv = make_element("nvvideoconvert", None, get_nvvidconv_props())
-        except RuntimeError:
-            conv = make_element("videoconvert", None)
+        conv_props = get_nvvidconv_props()
+        if platform.is_jetson:
+            conv_props['copy-hw'] = 2
+        conv = make_element("nvvideoconvert", None, conv_props)
         elements.append(conv)
+
+        # Queue after converter - isolate buffers from inference pipeline (critical for Jetson)
+        # if platform.is_jetson:
+        #     queue2 = make_element("queue", None, {
+        #         "max-size-buffers": 2,
+        #         "max-size-bytes": 0,
+        #         "max-size-time": 0,
+        #         "leaky": 2
+        #     })
+        #     elements.append(queue2)
 
         # Caps filter - encoder needs I420 format
         caps = make_element("capsfilter", None, {
@@ -228,27 +217,27 @@ class StreamPublisher:
 
         # H264 parser
         parse = make_element("h264parse", None, {
-            "config-interval": 1
+            "config-interval": 1,
+            "disable-passthrough": True
         })
+
         elements.append(parse)
 
-        # MPEG-TS muxer (SRT typically uses MPEG-TS container)
-        mux = make_element("mpegtsmux", None, {
-            "alignment": 7  # Align to 188*7 = 1316 bytes (SRT packet size)
+        # RTP payloader - NOT added to elements, attached to sink
+        pay = make_element("rtph264pay", None, {
+            "config-interval": 1,
+            "pt": 96
         })
-        elements.append(mux)
 
-        # Parse URI and extract streamid
-        srt_params = self._parse_srt_uri(uri)
-        sink_props = {
-            "uri": srt_params["uri"],
-            "wait-for-connection": False,
-            "sync": False
-        }
-        if "streamid" in srt_params:
-            sink_props["streamid"] = srt_params["streamid"]
-
-        sink = make_element("srtsink", None, sink_props)
+        # RTSP client sink
+        sink = make_element("rtspclientsink", None, {
+            "location": uri,
+            "protocols": 4,  # TCP
+            "latency": 0,
+            "do-rtsp-keep-alive": True
+        })
+        # Attach payloader to sink for later use
+        sink._payloader = pay
         elements.append(sink)
 
         return elements
@@ -260,9 +249,9 @@ class StreamPublisher:
         uri: str,
         bitrate: int = 4000000
     ) -> bool:
-        """Start SRT publishing for specific camera with annotations."""
-        if not uri.startswith("srt://"):
-            logger.error(f"[StreamPublisher] Invalid SRT URL: {uri}")
+        """Start RTSP publishing for specific camera with annotations."""
+        if not uri.startswith("rtsp://"):
+            logger.error(f"[StreamPublisher] Invalid RTSP URL: {uri}")
             return False
 
         with self._lock:
@@ -285,14 +274,38 @@ class StreamPublisher:
                 return False
 
             elements = []
+            prev_state = Gst.State.NULL
             try:
+                # Get pipeline state and pause for safe topology change
+                _, prev_state, _ = self.pipeline.get_state(0)
+                if prev_state == Gst.State.PLAYING:
+                    logger.info(f"[StreamPublisher] Pausing pipeline for RTSP setup")
+                    self.pipeline.set_state(Gst.State.PAUSED)
+                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
+                    time.sleep(0.3)
+
                 # Create and add elements
                 elements = self._create_stream_chain(uri, bitrate)
                 for elem in elements:
                     self.pipeline.add(elem)
 
-                # Link stream chain
-                link_chain(elements)
+                # Link all elements except rtspclientsink
+                link_chain(elements[:-1])
+
+                # rtspclientsink needs special handling with request pad
+                parse = elements[-2]  # h264parse (last before sink)
+                sink = elements[-1]   # rtspclientsink
+
+                # Get request pad from rtspclientsink
+                sink_pad = sink.get_request_pad("sink_%u")
+                if not sink_pad:
+                    raise RuntimeError("Failed to get request pad from rtspclientsink")
+
+                # Link parse to sink
+                parse_src = parse.get_static_pad("src")
+                ret = parse_src.link(sink_pad)
+                if ret != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f"Failed to link to rtspclientsink: {ret}")
 
                 # Get demux pad
                 demux_src = self._get_demux_pad(demux, cam.source_id)
@@ -301,27 +314,20 @@ class StreamPublisher:
 
                 queue_sink = elements[0].get_static_pad("sink")
 
-                # State transitions BEFORE linking to demux
-                _, pipeline_state, _ = self.pipeline.get_state(0)
-                logger.info(f"[StreamPublisher] Pipeline: {pipeline_state}, transitioning elements...")
-
-                # READY -> PAUSED -> link -> PLAYING
-                self._set_elements_state(elements, Gst.State.READY)
-                time.sleep(0.1)
-                self._set_elements_state(elements, Gst.State.PAUSED, wait=False)
-                time.sleep(0.2)
-
                 # Link to demux
                 link_result = demux_src.link(queue_sink)
                 if link_result != Gst.PadLinkReturn.OK:
                     raise RuntimeError(f"Failed to link demux pad: {link_result}")
                 logger.info(f"[StreamPublisher] Linked src_{cam.source_id} to stream chain")
 
-                # Transition to PLAYING
-                time.sleep(0.2)
-                if pipeline_state == Gst.State.PLAYING:
-                    self._set_elements_state(elements, Gst.State.PLAYING)
-                time.sleep(0.3)
+                # Sync element states with parent
+                for elem in elements:
+                    elem.sync_state_with_parent()
+
+                # Resume pipeline
+                if prev_state == Gst.State.PLAYING:
+                    self.pipeline.set_state(Gst.State.PLAYING)
+                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
 
                 # Store publish info
                 self._publishers[key] = PublishInfo(
@@ -341,6 +347,9 @@ class StreamPublisher:
             except Exception as e:
                 logger.error(f"[StreamPublisher] Failed to start publish: {e}", exc_info=True)
                 self._cleanup_elements(elements)
+                # Restore pipeline state
+                if prev_state == Gst.State.PLAYING:
+                    self.pipeline.set_state(Gst.State.PLAYING)
                 return False
 
     def _cleanup_elements(self, elements: list) -> None:
@@ -371,7 +380,7 @@ class StreamPublisher:
                 if demux_pad and elements:
                     blocked = threading.Event()
 
-                    def block_probe(pad, info):
+                    def block_probe(_pad, _info):
                         blocked.set()
                         return Gst.PadProbeReturn.OK
 

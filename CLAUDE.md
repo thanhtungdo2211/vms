@@ -102,7 +102,7 @@ curl http://localhost:8083/api/cameras | python3 -m json.tool
 # Start stream
 curl -X POST http://localhost:8083/api/cameras/cam1/branches/detection/stream/start \
   -H "Content-Type: application/json" \
-  -d '{"uri": "srt://192.168.6.14:8890?streamid=publish:cam1_detection", "bitrate": 4000000}'
+  -d '{"uri": "rtsp://192.168.6.14:8554/cam1_detection", "bitrate": 4000000}'
 
 # Stop stream
 curl -X POST http://localhost:8083/api/cameras/cam1/branches/detection/stream/stop

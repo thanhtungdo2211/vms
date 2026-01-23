@@ -55,10 +55,10 @@ def get_encoder_element(bitrate: int) -> Tuple[str, dict]:
     return (
         "x264enc",
         {"bitrate": bitrate // 1000, "speed-preset": "ultrafast",
-         "tune": "zerolatency", "threads": 1, "bframes": 0, 
+         "tune": "zerolatency", "threads": 4, "bframes": 0, 
          "key-int-max": 30, 
-         "vbv-buf-capacity": 200, 
-         "option-string": "aud=1:slice-max-size=1316"
+        #  "vbv-buf-capacity": 200, 
+        #  "option-string": "aud=1:slice-max-size=1316"
          }
     )
 

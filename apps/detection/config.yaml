@@ -1,25 +1,25 @@
 sink:
-  enable: true
-  type: fakesink   # Main sink is fakesink, real output via demux RTSP
-  properties:
-    sync: false
+    enable: true
+    type: fakesink # Main sink is fakesink, real output via demux RTSP
+    properties:
+        sync: false
 
 muxer:
-  batch-size: 8
-  width: 1920
-  height: 1080
-  nvbuf-memory-type: 0
-  batched-push-timeout: 40000
-  live-source: 1
+    batch-size: 8
+    width: 1920
+    height: 1080
+    nvbuf-memory-type: 0
+    batched-push-timeout: 40000
+    live-source: 1
 
 # Demux BEFORE OSD - each camera gets its own OSD in RTSP chain
 # Architecture: mux → PGIE → nvstreamdemux → (per-cam: OSD → enc → RTSP)
 elements:
-  - type: queue
-  - type: nvvideoconvert
-  - type: capsfilter
-    caps: "video/x-raw(memory:NVMM), format=RGBA"
-  - type: nvinfer
-    config_file: "data/face/models/scrfd640/infer.txt"
-  - type: nvstreamdemux
-    # probes: {sink: detection_fps_probe}  # Disabled to test stability
+    - type: queue
+    - type: nvvideoconvert
+    - type: capsfilter
+      caps: "video/x-raw(memory:NVMM), format=RGBA"
+    - type: nvinfer
+      config_file: "data/face/models/scrfd640/infer.txt"
+      probes: { src: detection_fps_probe }
+    - type: nvstreamdemux
