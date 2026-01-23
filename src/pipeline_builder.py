@@ -131,22 +131,16 @@ class PipelineBuilder:
         if not branches_cfg:
             raise RuntimeError("No branches configured")
 
-        # Build branches
-        for name, cfg in branches_cfg.items():
-            self._build_branch(name, cfg)
-
-        self.pipeline.get_bus().add_signal_watch()
-        logger.info(f"Pipeline built: {len(self.branches)} branches")
-
         # Start sinks
         for sink in self.branch_sinks.values():
             sink.start()
 
-        # Create camera manager (provides SourceIDMapper)
-        self.camera_manager = MultibranchCameraManager(self.pipeline, self.branches)
+        # Create camera manager (provides SourceIDMapper) - BEFORE building branches
+        # so we have source_mapper available for processor instantiation
+        self.camera_manager = MultibranchCameraManager(self.pipeline, {})
         source_mapper = self.camera_manager.get_mapper()
 
-        # Instantiate processors with config, sink, and source_mapper
+        # Instantiate processors BEFORE building branches (so probes are registered first)
         for name, proc_class in self.processor_classes.items():
             cfg = branches_cfg.get(name, {})
             if isinstance(cfg, str):
@@ -158,9 +152,19 @@ class PipelineBuilder:
             self.processors[name] = proc
             print(f"[PipelineBuilder] Instantiated: {proc_class.__name__} for '{name}'")
 
-            # Register probes
+            # Register probes BEFORE building branches
             for probe_name, cb in proc.get_probes().items():
                 self.probe_registry.register(probe_name, cb)
+
+        # Build branches (now probes are registered and can be attached)
+        for name, cfg in branches_cfg.items():
+            self._build_branch(name, cfg)
+
+        # Update camera manager with built branches
+        self.camera_manager.branches = self.branches
+
+        self.pipeline.get_bus().add_signal_watch()
+        logger.info(f"Pipeline built: {len(self.branches)} branches")
 
         # Notify processors that pipeline is built
         for name, proc in self.processors.items():
@@ -172,10 +176,6 @@ class PipelineBuilder:
             self.pipeline, self.branches, self.camera_manager
         )
         logger.info("Stream publisher created (per-camera annotated streams)")
-
-        # Set READY and warmup
-        if not self.set_ready_and_warmup():
-            raise RuntimeError("Failed to set pipeline READY state")
 
         # Start processors
         self.start_processors()
@@ -189,44 +189,7 @@ class PipelineBuilder:
         self.api_server.start()
 
         return self.pipeline
-
-    def set_ready_and_warmup(self) -> bool:
-        """Set pipeline to READY state and run warmup.
-
-        Returns True if successful, False on failure.
-        Call this AFTER creating RTSP publishers (they need NULL state pads).
-        """
-        from src.warmup_manager import WarmupManager
-
-        # Set to READY state (prevents nvstreammux crash with empty sources)
-        logger.info("Setting pipeline to READY (will PLAY after first camera added)...")
-        ret = self.pipeline.set_state(Gst.State.READY)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            logger.error("Failed to set pipeline to READY!")
-            return False
-
-        # Wait for READY state
-        ret, _, _ = self.pipeline.get_state(5 * Gst.SECOND)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            logger.error("Pipeline failed to reach READY state!")
-            return False
-
-        logger.info("Pipeline READY - waiting for cameras...")
-
-        # Warmup: Pre-load TensorRT engines
-        warmup_config = self.config.get("warmup", {})
-        if warmup_config.get("enabled", True):
-            logger.info("Pre-loading inference engines...")
-            warmup = WarmupManager(self.pipeline, self.branches)
-            timeout = warmup_config.get("timeout", 15.0)
-            num_frames = warmup_config.get("num_frames", 64)
-            if warmup.warmup(timeout=timeout, num_frames=num_frames):
-                logger.info("Warmup complete - engines ready")
-            else:
-                logger.warning("Warmup failed, first camera may have latency")
-
-        return True
-
+    
     def _build_branch(self, name: str, cfg) -> None:
         """Build single branch: mux -> elements -> sink."""
         if isinstance(cfg, str):

@@ -8,7 +8,7 @@ from pydantic import BaseModel
 class AddCameraRequest(BaseModel):
     camera_id: str
     uri: str
-    branches: List[str] = []
+    branch: str
 
 
 def create_router(server) -> APIRouter:
@@ -21,7 +21,7 @@ def create_router(server) -> APIRouter:
 
     @router.post("/cameras")
     async def add_camera(req: AddCameraRequest):
-        op_id = server._enqueue("add_camera", server.manager.add_camera, req.camera_id, req.uri, req.branches)
+        op_id = server._enqueue("add_camera", server.manager.add_camera, req.camera_id, req.uri, req.branch)
         return {"status": "accepted", "operation_id": op_id}
 
     @router.delete("/cameras/{camera_id}")

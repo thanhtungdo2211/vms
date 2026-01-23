@@ -11,5 +11,5 @@ pipeline:
     # area_monitoring: apps/area_monitoring/config.yaml
     # fire_detection: apps/fire_detection/config.yaml
 
-    recognition: apps/face/config-demux.yaml
-    detection: apps/detection/config-demux.yaml
+    recognition: apps/face/config.yaml
+    detection: apps/detection/config.yaml

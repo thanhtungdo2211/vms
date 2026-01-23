@@ -88,10 +88,13 @@ Base URL: `http://localhost:8083`
 # Health check
 curl http://localhost:8083/api/health
 
-# Add camera
+# Add camera (with 1 branch)
 curl -X POST http://localhost:8083/api/cameras \
   -H "Content-Type: application/json" \
-  -d '{"camera_id": "cam1", "uri": "rtsp://192.168.6.14:8554/testface", "branches": ["recognition", "detection"]}'
+  -d '{"camera_id": "cam1", "uri": "rtsp://192.168.6.14:8554/testface", "branch": "detection"}'
+
+# Add camera to another branch
+curl -X POST http://localhost:8083/api/cameras/cam1/branches/recognition
 
 # List cameras
 curl http://localhost:8083/api/cameras | python3 -m json.tool

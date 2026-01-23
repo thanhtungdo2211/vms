@@ -275,15 +275,11 @@ class MultibranchCameraManager:
     # Camera Operations
     # ─────────────────────────────────────────────────────────────────────────
 
-    def add_camera(self, camera_id: str, uri: str, branch_names: list[str]) -> bool:
-        """Add camera to branches dynamically without pausing pipeline."""
+    def add_camera(self, camera_id: str, uri: str, branch_name: str) -> bool:
+        """Add camera to branch dynamically without pausing pipeline."""
         with self._lock:
             self._delay()
             if camera_id in self._cameras:
-                return False
-
-            branches = [b for b in branch_names if b in self.branches]
-            if not branches:
                 return False
 
             _, prev_state, _ = self.pipeline.get_state(0)
@@ -310,11 +306,10 @@ class MultibranchCameraManager:
 
                 self.pipeline.add(bin_elem)
 
-                # Link branches
+                # Link branch
                 branch_pads = {}
-                for b in branches:
-                    pad = self._link_branch(bin_elem, tee, camera_id, source_id, b, sync=False)
-                    branch_pads[b] = pad
+                pad = self._link_branch(bin_elem, tee, camera_id, source_id, branch_name, sync=False)
+                branch_pads[branch_name] = pad
 
                 # Wait for file source pad linking
                 if is_file and pad_linked_event:
@@ -335,7 +330,7 @@ class MultibranchCameraManager:
                 )
 
                 self._last_op = time.time()
-                logger.info(f"[CAM] Added {camera_id} to branches: {branches}")
+                logger.info(f"[CAM] Added {camera_id} to branch: {branch_name}")
                 return True
 
             except Exception as e:

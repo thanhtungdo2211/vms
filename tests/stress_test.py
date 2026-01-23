@@ -25,9 +25,9 @@ BASE_URL = "http://localhost:8083"
 STREAM_SERVER = "192.168.6.14"
 STREAM_PORT = 8890
 CAMERA_URI = "rtsp://192.168.6.14:8554/testface"
-MAX_CAMERAS = 1
-STREAM_CAMS = 1
-STREAM_STABILIZE = 1
+MAX_CAMERAS = 3
+STREAM_CAMS = 3
+STREAM_STABILIZE = 3
 
 
 def api(method: str, endpoint: str, data: dict = None) -> dict:
@@ -60,11 +60,11 @@ def health() -> dict:
     return api("GET", "/api/health")
 
 
-def add_camera(cam_id: str, branches: list) -> bool:
+def add_camera(cam_id: str, branch: str) -> bool:
     r = api("POST", "/api/cameras", {
         "camera_id": cam_id,
         "uri": CAMERA_URI,
-        "branches": branches
+        "branch": branch
     })
     if "operation_id" in r:
         return wait_op(r["operation_id"]).get("status") == "ok"
@@ -97,7 +97,7 @@ def make_stream_uri(cam_id: str, branch: str) -> str:
     return f"srt://{STREAM_SERVER}:{STREAM_PORT}?streamid={stream_id}&pkt_size=1316"
 
 
-def start_stream(cam_id: str, branch: str, bitrate: int = 1000000) -> bool:
+def start_stream(cam_id: str, branch: str, bitrate: int = 4000000) -> bool:
     uri = make_stream_uri(cam_id, branch)
     r = api("POST", f"/api/cameras/{cam_id}/branches/{branch}/stream/start", {
         "uri": uri,
@@ -127,7 +127,7 @@ def check_stream_live(host: str, port: int, stream_id: str, timeout: int = 8) ->
         cmd = [
             "ffprobe", "-v", "error",
             "-rtsp_transport", "tcp",
-            "-stimeout", str(timeout * 1000000),
+            "-stimeout", str(timeout * 4000000),
             "-show_entries", "stream=codec_name",
             "-of", "default=nw=1",
             f"rtsp://{host}:{8554}/{stream_id.replace('publish:', '')}"
@@ -194,12 +194,14 @@ def main():
     if h.get("cameras", 0) > 0:
         cleanup()
 
-    # TEST 1: Add cameras
+
+    # TEST 1: Add cameras (add with 1 branch, then add to another branch)
     step("TEST 1: Add Cameras")
     for i in range(1, MAX_CAMERAS + 1):
-        ok = add_camera(f"cam{i}", ["detection", "recognition"])
-        log(f"  Add cam{i}: {'OK' if ok else 'FAIL'}")
-        if not ok:
+        ok1 = add_camera(f"cam{i}", "detection")
+        ok2 = add_to_branch(f"cam{i}", "recognition")
+        log(f"  Add cam{i}: {'OK' if (ok1 and ok2) else 'FAIL'}")
+        if not (ok1 and ok2):
             failures += 1
 
     h = health()
@@ -225,14 +227,14 @@ def main():
     if not verify(f"{STREAM_CAMS} detection streams live", all_live):
         failures += 1
 
-    # # TEST 3: Stream on recognition (concurrent)
-    # step(f"TEST 3: Stream on Recognition ({STREAM_CAMS} cameras concurrent)")
+    # TEST 3: Stream on recognition (concurrent)
+    step(f"TEST 3: Stream on Recognition ({STREAM_CAMS} cameras concurrent)")
 
-    # for i in range(1, STREAM_CAMS + 1):
-    #     ok = start_stream(f"cam{i}", "recognition", bitrate=1000000)
-    #     log(f"  Start cam{i}/recognition: {'OK' if ok else 'FAIL'}")
-    #     if not ok:
-    #         failures += 1
+    for i in range(1, STREAM_CAMS + 1):
+        ok = start_stream(f"cam{i}", "recognition", bitrate=4000000)
+        log(f"  Start cam{i}/recognition: {'OK' if ok else 'FAIL'}")
+        if not ok:
+            failures += 1
 
     # log(f"Waiting {STREAM_STABILIZE}s for stabilization...")
     # time.sleep(STREAM_STABILIZE)
@@ -267,7 +269,7 @@ def main():
     # ok = add_to_branch("cam1", "recognition")
     # log(f"  Add cam1 to recognition: {'OK' if ok else 'FAIL'}")
 
-    # ok = start_stream("cam1", "recognition", bitrate=1000000)
+    # ok = start_stream("cam1", "recognition", bitrate=4000000)
     # log(f"  Start cam1/recognition: {'OK' if ok else 'FAIL'}")
 
     # # TEST 5: Stop/Start cycle

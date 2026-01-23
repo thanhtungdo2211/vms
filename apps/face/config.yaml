@@ -2,14 +2,12 @@ params:
   features_json: "${FEATURES_JSON:data/face/features.json}"
   l2_threshold: 1.0
   min_streak: 3
-  
+
 sink:
   enable: true
-  type: filesink   # Các loại: filesink, fakesink, rtsp, display
+  type: fakesink   # Main sink is fakesink, real output via demux RTSP
   properties:
-    location: "${OUTPUT_DIR:data/face/output_recognition.avi}"
     sync: false
-    qos: false
 
 muxer:
   batch-size: 8
@@ -19,26 +17,21 @@ muxer:
   batched-push-timeout: 40000
   live-source: 1
 
+# Demux BEFORE OSD - each camera gets its own OSD in RTSP chain
+# Architecture: mux → PGIE → Tracker → SGIE → nvstreamdemux → (per-cam: OSD → enc → RTSP)
 elements:
   - type: queue
   - type: nvvideoconvert
-    name: pre_tiler_conv
   - type: capsfilter
-    name: rgba_caps
-    caps: "video/x-raw(memory:NVMM), format=RGBA"  
+    caps: "video/x-raw(memory:NVMM), format=RGBA"
   - type: nvinfer
-    name: pgie
     config_file: "data/face/models/scrfd640/infer.txt"
   - type: nvtracker
-    name: tracker
     config_file: "data/face/models/NvDCF/config_tracker.txt"
     probes: {src: tracker_probe}
   - type: nvinfer
-    name: sgie
     config_file: "data/face/models/arcface/infer.txt"
     probes: {src: sgie_probe}
-  - type: nvmultistreamtiler
-    properties: { rows: 2, columns: 2, width: 1920, height: 1080 }
-  - type: nvdsosd
-    properties: { process-mode: 0, display-text: 1 }
-    probes: {src: recognition_fps_probe}
+  - type: nvstreamdemux
+
+  
