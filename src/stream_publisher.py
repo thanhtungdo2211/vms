@@ -194,11 +194,7 @@ class StreamPublisher:
         elements = []
 
         # Queue - buffering for timing variations
-        queue = make_element("queue", None, {
-            "max-size-buffers": 60,
-            "max-size-time": 2 * Gst.SECOND,
-            "leaky": 2
-        })
+        queue = make_element("queue", None, {})
         elements.append(queue)
 
         # OSD - draw annotations
@@ -232,7 +228,7 @@ class StreamPublisher:
 
         # H264 parser
         parse = make_element("h264parse", None, {
-            "config-interval": -1
+            "config-interval": 1
         })
         elements.append(parse)
 

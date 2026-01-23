@@ -38,7 +38,7 @@ def detect_platform() -> PlatformInfo:
     """Detect Jetson vs dGPU, return optimal settings."""
     is_jetson = os.path.exists("/etc/nv_tegra_release") or os.path.exists("/proc/device-tree/model")
     if is_jetson:
-        return PlatformInfo(True, "jetson", 0, "nvv4l2h264enc", 2)
+        return PlatformInfo(True, "jetson", 0, "", 2)
     return PlatformInfo(False, "dgpu", 3, "", 1)
 
 
@@ -49,14 +49,17 @@ def get_encoder_element(bitrate: int) -> Tuple[str, dict]:
     if platform.hw_encoder and Gst.ElementFactory.find(platform.hw_encoder):
         return (
             platform.hw_encoder,
-            {"bitrate": bitrate, "preset-level": 1, "iframeinterval": 30,
-             "control-rate": 1, "maxperf-enable": True}
+            {"bitrate": bitrate, "profile": 1, "iframeinterval": 30}
         )
 
     return (
         "x264enc",
         {"bitrate": bitrate // 1000, "speed-preset": "ultrafast",
-         "tune": "zerolatency", "threads": 4, "bframes": 0, "key-int-max": 30}
+         "tune": "zerolatency", "threads": 1, "bframes": 0, 
+         "key-int-max": 30, 
+         "vbv-buf-capacity": 200, 
+         "option-string": "aud=1:slice-max-size=1316"
+         }
     )
 
 
