@@ -1,101 +1,123 @@
 #!/bin/bash
-# Stress Test - Camera CRUD + Stream Publishing
-# Usage: ./tests/stress_test.sh
+# Stress Test: Multiple cameras add -> remove -> re-add -> stream
+# Scenario:
+#   1. Add cam1-cam8 to branch detection
+#   2. Remove cam6, cam7, cam8
+#   3. Re-add cam6, cam7, cam8
+#   4. Stream cam1 detection to RTSP server
 
-BASE_URL="http://localhost:8083"
-STREAM_SERVER="152.42.221.89:8554"
 CAMERA_URI="rtsp://192.168.6.14:8554/testface"
+STREAM_SERVER="152.42.221.89"
+STREAM_PORT="8554"
+STREAM_NAME="cam1_detection"
+STREAM_URI="rtsp://${STREAM_SERVER}:${STREAM_PORT}/${STREAM_NAME}"
 
-echo "============================================================"
-echo "  STRESS TEST: Camera CRUD + Stream Publishing"
-echo "============================================================"
+# Function to wait for operation to complete
+wait_for_operation() {
+  local op_id=$1
+  local max_wait=${2:-30}  # Default 30 seconds timeout
+  local wait_time=0
 
-# Helper: Wait for operation
-wait_operation() {
-    local op_id="$1"
-    local max_wait="${2:-60}"
+  while [ $wait_time -lt $max_wait ]; do
+    result=$(curl -s http://localhost:8083/api/operations/${op_id})
+    status=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
 
-    for i in $(seq 1 $max_wait); do
-        OP_STATUS=$(curl -s http://localhost:8083/api/operations/$op_id)
-        STATUS=$(echo "$OP_STATUS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null)
+    if [ "$status" = "ok" ] || [ "$status" = "completed" ]; then
+      echo "  ✓ Operation $op_id completed"
+      return 0
+    elif [ "$status" = "error" ]; then
+      echo "  ✗ Operation $op_id failed:"
+      echo "$result" | python3 -m json.tool
+      return 1
+    fi
 
-        if [ "$STATUS" = "ok" ]; then
-            echo "  ✓ Success (${i}s)"
-            return 0
-        elif [ "$STATUS" = "error" ]; then
-            echo "  ✗ Failed:"
-            echo "$OP_STATUS" | python3 -m json.tool
-            return 1
-        fi
-        sleep 1
-    done
-    echo "  ⏱ Timeout after ${max_wait}s"
-    return 1
+    sleep 1
+    wait_time=$((wait_time + 1))
+  done
+
+  echo "  ⚠ Operation $op_id timeout after ${max_wait}s"
+  return 2
 }
 
-# Pre-check
-echo -e "\n[Health Check]"
-curl -s http://localhost:8083/api/health | python3 -m json.tool
+echo "============================================================"
+echo "  STRESS TEST: Multiple Cameras Add/Remove/Stream"
+echo "============================================================"
 
-echo -e "\n[Pipeline Status]"
-curl -s http://localhost:8083/api/status | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(f\"State: {d['pipeline']['state']}\")
-print(f\"Cameras: {d['cameras']['count']}\")
-print(f\"Operations queue: {d['operations']['queue_size']}\")
-print(f\"Last op: {d['system']['last_operation_type']}\")
-"
+# Step 1: Add cam1-cam8 to branch detection
+echo -e "\n[1] Adding cam1-cam8 to branch detection..."
+for i in {1..8}; do
+  echo "Adding cam${i}..."
+  response=$(curl -s -X POST http://localhost:8083/api/cameras \
+    -H "Content-Type: application/json" \
+    -d '{"camera_id":"cam'$i'","uri":"'$CAMERA_URI'","branch":"detection"}')
+  echo "$response" | python3 -m json.tool
 
-# Cleanup
-echo -e "\n[Cleanup] Removing all cameras..."
-RESP=$(curl -s -X DELETE http://localhost:8083/api/cameras/cam1)
-OP_ID=$(echo "$RESP" | python3 -c "import sys, json; print(json.load(sys.stdin).get('operation_id',''))" 2>/dev/null)
-if [ -n "$OP_ID" ]; then
-    wait_operation "$OP_ID" 10
-fi
+  op_id=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('operation_id',''))" 2>/dev/null)
+  if [ -n "$op_id" ]; then
+    wait_for_operation "$op_id"
+  fi
+done
 
-# Test 1: Add camera
-echo -e "\n[TEST 1] Adding cam1 to detection..."
-RESP=$(curl -s -X POST http://localhost:8083/api/cameras \
+echo -e "\n[1.1] Listing all cameras..."
+curl -s http://localhost:8083/api/cameras | python3 -m json.tool
+
+# Step 2: Remove cam6, cam7, cam8
+echo -e "\n[2] Removing cam6, cam7, cam8..."
+for i in {6..8}; do
+  echo "Removing cam${i}..."
+  response=$(curl -s -X DELETE http://localhost:8083/api/cameras/cam${i})
+  echo "$response" | python3 -m json.tool
+
+  op_id=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('operation_id',''))" 2>/dev/null)
+  if [ -n "$op_id" ]; then
+    wait_for_operation "$op_id"
+  fi
+done
+
+echo -e "\n[2.1] Listing cameras after removal..."
+curl -s http://localhost:8083/api/cameras | python3 -m json.tool
+
+# Step 3: Re-add cam6, cam7, cam8
+echo -e "\n[3] Re-adding cam6, cam7, cam8 to branch detection..."
+for i in {6..8}; do
+  echo "Re-adding cam${i}..."
+  response=$(curl -s -X POST http://localhost:8083/api/cameras \
+    -H "Content-Type: application/json" \
+    -d '{"camera_id":"cam'$i'","uri":"'$CAMERA_URI'","branch":"detection"}')
+  echo "$response" | python3 -m json.tool
+
+  op_id=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('operation_id',''))" 2>/dev/null)
+  if [ -n "$op_id" ]; then
+    wait_for_operation "$op_id"
+  fi
+done
+
+echo -e "\n[3.1] Listing all cameras after re-adding..."
+curl -s http://localhost:8083/api/cameras | python3 -m json.tool
+
+# Step 4: Stream cam1 detection
+echo -e "\n[4] Starting stream cam1_detection to $STREAM_URI..."
+response=$(curl -s -X POST http://localhost:8083/api/cameras/cam1/branches/detection/stream/start \
   -H "Content-Type: application/json" \
-  -d '{"camera_id":"cam1","uri":"'$CAMERA_URI'","branch":"detection"}')
+  -d '{"uri":"'$STREAM_URI'","bitrate":4000000}')
+echo "$response" | python3 -m json.tool
 
-echo "$RESP" | python3 -m json.tool
-OP_ID=$(echo "$RESP" | python3 -c "import sys, json; print(json.load(sys.stdin).get('operation_id',''))" 2>/dev/null)
-if [ -n "$OP_ID" ]; then
-    wait_operation "$OP_ID"
+op_id=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('operation_id',''))" 2>/dev/null)
+if [ -n "$op_id" ]; then
+  wait_for_operation "$op_id" 60  # Stream may take longer
 fi
 
-# Test 2: Start stream
-echo -e "\n[TEST 2] Starting stream for cam1/detection..."
-RESP=$(curl -s -X POST http://localhost:8083/api/cameras/cam1/branches/detection/stream/start \
-  -H "Content-Type: application/json" \
-  -d '{"uri":"rtsp://'$STREAM_SERVER'/stress_cam1_detection","bitrate":4000000}')
+sleep 3  # Small buffer for stream to stabilize
 
-echo "$RESP" | python3 -m json.tool
-OP_ID=$(echo "$RESP" | python3 -c "import sys, json; print(json.load(sys.stdin).get('operation_id',''))" 2>/dev/null)
-if [ -n "$OP_ID" ]; then
-    wait_operation "$OP_ID"
+# Verify stream is live
+echo -e "\n[5] Verifying stream..."
+if ffprobe -v quiet -rtsp_transport tcp -stimeout 8000000 \
+   -show_entries stream=codec_name -of default=nw=1 "$STREAM_URI" 2>&1 | grep -q codec_name; then
+    echo "✓ Stream is LIVE: $STREAM_URI"
+    ffprobe -v quiet -rtsp_transport tcp -stimeout 8000000 \
+      -show_entries stream=codec_name,width,height -of json "$STREAM_URI" 2>/dev/null | python3 -m json.tool
+    exit 0
+else
+    echo "✗ Stream NOT live: $STREAM_URI"
+    exit 1
 fi
-
-# Check streams
-echo -e "\n[Status] All streams:"
-curl -s http://localhost:8083/api/streams | python3 -m json.tool
-
-# Final detailed status
-echo -e "\n[Final Detailed Status]"
-curl -s http://localhost:8083/api/status | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print('='*60)
-print(f\"Pipeline: {d['pipeline']['state']}\")
-print(f\"Cameras: {d['cameras']['count']}\")
-for cam_id, info in d['cameras']['details'].items():
-    print(f\"  - {cam_id}: state={info['state']}, branches={info['branches']}\")
-print(f\"Streams: {len(d.get('streams', {}))}\")
-print(f\"Queue size: {d['operations']['queue_size']}\")
-print('='*60)
-"
-
-echo -e "\n[Done] Test completed!"
