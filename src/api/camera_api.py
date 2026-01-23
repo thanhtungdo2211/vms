@@ -76,11 +76,33 @@ class CameraAPIServer:
                         time.sleep(delay - elapsed)
                     self._last_op_time = time.time()
                     self._last_op_type = op_type
+
+                start_time = time.time()
                 try:
                     result = func(*args, **kwargs)
-                    self._op_results[op_id] = {"status": "ok", "result": result}
+                    duration = time.time() - start_time
+                    self._op_results[op_id] = {
+                        "status": "ok",
+                        "operation_type": op_type,
+                        "duration": round(duration, 2),
+                        "timestamp": start_time,
+                        "result": result
+                    }
+                    logger.info(f"[API] Operation {op_id} ({op_type}) completed in {duration:.2f}s")
                 except Exception as e:
-                    self._op_results[op_id] = {"status": "error", "error": str(e)}
+                    import traceback
+                    duration = time.time() - start_time
+                    error_trace = traceback.format_exc()
+                    self._op_results[op_id] = {
+                        "status": "error",
+                        "operation_type": op_type,
+                        "duration": round(duration, 2),
+                        "timestamp": start_time,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "traceback": error_trace
+                    }
+                    logger.error(f"[API] Operation {op_id} ({op_type}) failed: {e}\n{error_trace}")
                 self._op_queue.task_done()
             except queue.Empty:
                 continue
@@ -107,10 +129,33 @@ class CameraAPIServer:
 
         return app
 
+    def _kill_port(self):
+        """Kill any process using the API port."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{self.port}"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                for pid in pids:
+                    logger.warning(f"[CameraAPI] Killing process {pid} using port {self.port}")
+                    subprocess.run(["kill", "-9", pid], timeout=1)
+                time.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"[CameraAPI] Port check failed: {e}")
+
     def start(self):
         _setup_signal_handlers()
         threading.Thread(target=self._process_ops, daemon=True).start()
         self._app = self._create_app()
+
+        # Try to kill any process using the port
+        self._kill_port()
+
         config = uvicorn.Config(self._app, host=self.host, port=self.port, log_level="warning")
         self._server = uvicorn.Server(config=config)
         threading.Thread(target=self._server.run, daemon=True).start()

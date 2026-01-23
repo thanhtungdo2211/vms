@@ -31,6 +31,7 @@ class CameraInfo:
     uri: str
     branch_pads: dict[str, Gst.Pad]
     is_file: bool = False
+    is_paused: bool = False  # True if camera is paused (soft-removed)
 
 
 class MultibranchCameraManager:
@@ -276,67 +277,139 @@ class MultibranchCameraManager:
     # ─────────────────────────────────────────────────────────────────────────
 
     def add_camera(self, camera_id: str, uri: str, branch_name: str) -> bool:
-        """Add camera to branch dynamically without pausing pipeline."""
+        """
+        Add camera to pipeline.
+        Handles 3 cases:
+        1. New camera: Create new bin with source
+        2. Paused camera (same URI): Resume instantly
+        3. Paused camera (different URI): Full recreation with cleanup
+        """
         with self._lock:
             self._delay()
+
+            # Handle existing camera (paused or active)
             if camera_id in self._cameras:
-                return False
+                handled, success = self._handle_existing_camera(camera_id, uri, branch_name)
+                if handled:
+                    return success
+                # If not handled, fall through to create new camera
 
-            _, prev_state, _ = self.pipeline.get_state(0)
-            is_rtsp = uri.startswith("rtsp://") or uri.startswith("rtsps://")
-            is_file = uri.startswith("file://")
+            # Create new camera
+            return self._create_new_camera(camera_id, uri, branch_name)
 
-            logger.info(f"[CAM] Adding {camera_id} - state: {prev_state.value_nick}")
+    def _handle_existing_camera(self, camera_id: str, uri: str, branch_name: str) -> tuple[bool, bool]:
+        """
+        Handle add request for existing camera (paused or active).
+        Returns: (handled, success)
+            - (True, True): Camera resumed successfully
+            - (True, False): Camera already active
+            - (False, False): Need to recreate, caller should create new camera
+        """
+        cam = self._cameras[camera_id]
 
-            try:
-                # Create camera bin
-                source_id = self._mapper.add(camera_id, uri)
-                bin_elem = Gst.Bin.new(f"cam_{camera_id}")
-                tee = make_element("tee", f"tee_{camera_id}", {"allow-not-linked": True})
-                bin_elem.add(tee)
+        if not cam.is_paused:
+            # Camera already active
+            return (True, False)
 
-                linked_state = {"done": False}
-                pad_linked_event = None
+        # Camera is paused - check if URI changed
+        if cam.uri == uri:
+            # FAST PATH: Same URI - just resume
+            logger.info(f"[CAM] Resuming paused camera {camera_id}...")
+            cam.bin.set_state(Gst.State.PLAYING)
+            cam.bin.get_state(STATE_CHANGE_TIMEOUT)
+            cam.is_paused = False
+            self._last_op = time.time()
+            logger.info(f"[CAM] Camera {camera_id} resumed instantly")
+            return (True, True)
 
-                # Create source
-                if is_rtsp:
-                    self._create_rtsp_source(camera_id, uri, source_id, bin_elem, tee, linked_state)
-                else:
-                    _, pad_linked_event = self._create_file_source(camera_id, uri, bin_elem, tee, linked_state)
+        # URI changed - need full recreation
+        logger.info(f"[CAM] Camera {camera_id} has different URI, recreating...")
+        self._recreate_paused_camera(cam, camera_id)
+        return (False, False)  # Signal caller to create new camera
 
-                self.pipeline.add(bin_elem)
+    def _recreate_paused_camera(self, cam: CameraInfo, camera_id: str) -> None:
+        """Remove paused camera completely for recreation with new URI."""
+        # Unlink all branches to release mux pads
+        for b in list(cam.branch_pads.keys()):
+            self._unlink_branch(cam, b, camera_id)
 
-                # Link branch
-                branch_pads = {}
-                pad = self._link_branch(bin_elem, tee, camera_id, source_id, branch_name, sync=False)
-                branch_pads[branch_name] = pad
+        # Remove bin
+        cam.bin.set_state(Gst.State.NULL)
+        cam.bin.get_state(STATE_CHANGE_TIMEOUT)
+        self.pipeline.remove(cam.bin)
 
-                # Wait for file source pad linking
-                if is_file and pad_linked_event:
-                    logger.info("[CAM] Waiting for uridecodebin pad linking...")
-                    pad_linked_event.wait(timeout=5.0)
-                    time.sleep(0.5)
+        # Cleanup tracking
+        self._mapper.remove(camera_id)
+        del self._cameras[camera_id]
 
-                # Sync camera bin and pipeline to PLAYING
-                self._incremental_state_sync(bin_elem, Gst.State.PLAYING)
-                if prev_state != Gst.State.PLAYING:
-                    self._resume_pipeline()
-                time.sleep(2.0)
+        # Force GC and wait for GPU cleanup
+        import gc
+        gc.collect()
+        logger.info(f"[CAM] Waiting for GPU cleanup (6s)...")
+        time.sleep(6.0)
 
-                # Store camera
-                self._cameras[camera_id] = CameraInfo(
-                    bin=bin_elem, tee=tee, source_id=source_id,
-                    uri=uri, branch_pads=branch_pads, is_file=is_file
-                )
+    def _create_new_camera(self, camera_id: str, uri: str, branch_name: str) -> bool:
+        """Create and add new camera to pipeline."""
+        _, prev_state, _ = self.pipeline.get_state(0)
+        is_rtsp = uri.startswith("rtsp://") or uri.startswith("rtsps://")
+        is_file = uri.startswith("file://")
 
-                self._last_op = time.time()
-                logger.info(f"[CAM] Added {camera_id} to branch: {branch_name}")
-                return True
+        logger.info(f"[CAM] Adding {camera_id} - state: {prev_state.value_nick}")
 
-            except Exception as e:
-                logger.error(f"add_camera failed: {e}", exc_info=True)
-                self._cleanup_failed_add(camera_id, bin_elem)
-                return False
+        try:
+            # Create camera bin
+            source_id = self._mapper.add(camera_id, uri)
+            bin_elem = Gst.Bin.new(f"cam_{camera_id}")
+            tee = make_element("tee", f"tee_{camera_id}", {"allow-not-linked": True})
+            bin_elem.add(tee)
+
+            linked_state = {"done": False}
+            pad_linked_event = None
+
+            # Create source
+            if is_rtsp:
+                self._create_rtsp_source(camera_id, uri, source_id, bin_elem, tee, linked_state)
+            else:
+                _, pad_linked_event = self._create_file_source(camera_id, uri, bin_elem, tee, linked_state)
+
+            self.pipeline.add(bin_elem)
+
+            # Link branch
+            branch_pads = {}
+            pad = self._link_branch(bin_elem, tee, camera_id, source_id, branch_name, sync=False)
+            branch_pads[branch_name] = pad
+
+            # Wait for file source pad linking
+            if is_file and pad_linked_event:
+                logger.info("[CAM] Waiting for uridecodebin pad linking...")
+                pad_linked_event.wait(timeout=5.0)
+                time.sleep(0.5)
+
+            # Sync camera bin to PLAYING
+            self._incremental_state_sync(bin_elem, Gst.State.PLAYING)
+
+            # Always ensure pipeline is PLAYING when we have cameras
+            if prev_state != Gst.State.PLAYING:
+                logger.info(f"[CAM] Pipeline was in {prev_state.value_nick}, resuming to PLAYING")
+                self._resume_pipeline()
+
+            time.sleep(2.0)
+
+            # Store camera
+            self._cameras[camera_id] = CameraInfo(
+                bin=bin_elem, tee=tee, source_id=source_id,
+                uri=uri, branch_pads=branch_pads, is_file=is_file,
+                is_paused=False
+            )
+
+            self._last_op = time.time()
+            logger.info(f"[CAM] Added {camera_id} to branch: {branch_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"add_camera failed: {e}", exc_info=True)
+            self._cleanup_failed_add(camera_id, bin_elem)
+            return False
 
     def _cleanup_failed_add(self, camera_id: str, bin_elem: Gst.Bin) -> None:
         """Cleanup after failed add_camera."""
@@ -349,41 +422,68 @@ class MultibranchCameraManager:
         self._mapper.remove(camera_id)
 
     def remove_camera(self, camera_id: str) -> bool:
-        """Remove camera from all branches."""
+        """
+        Remove camera from pipeline.
+        Strategy: If last camera, pause it (for fast re-add). Otherwise, full removal.
+        """
         with self._lock:
             self._delay()
             cam = self._cameras.get(camera_id)
             if not cam:
                 return False
 
+            is_last_camera = len(self._cameras) == 1
+
             try:
                 logger.info(f"[CAM] Removing {camera_id}...")
 
+                # Cleanup active streams
                 if self._stream_publisher:
                     self._stream_publisher.cleanup_camera(camera_id)
 
-                # Block data flow
-                for pad in cam.branch_pads.values():
-                    pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, lambda *_: Gst.PadProbeReturn.REMOVE)
-                time.sleep(0.2)
+                if is_last_camera:
+                    # OPTIMIZATION: Pause last camera to preserve GPU resources
+                    # This allows instant re-activation without decoder recreation
+                    logger.info(f"[CAM] Last camera - pausing bin (preserves GPU resources)")
+                    cam.bin.set_state(Gst.State.PAUSED)
+                    cam.bin.get_state(STATE_CHANGE_TIMEOUT)
+                    cam.is_paused = True
+                    logger.info(f"[CAM] Camera {camera_id} paused (can be resumed instantly)")
+                else:
+                    # Full removal when other cameras exist
+                    self._remove_camera_full(cam, camera_id)
 
-                cam.bin.set_state(Gst.State.NULL)
-                cam.bin.get_state(Gst.CLOCK_TIME_NONE)
-
-                for b in list(cam.branch_pads.keys()):
-                    self._unlink_branch(cam, b, camera_id)
-
-                self.pipeline.remove(cam.bin)
-                self._mapper.remove(camera_id)
-                del self._cameras[camera_id]
                 self._last_op = time.time()
-
                 logger.info(f"[CAM] Removed {camera_id}")
                 return True
 
             except Exception as e:
                 logger.error(f"remove_camera failed: {e}", exc_info=True)
                 return False
+
+    def _remove_camera_full(self, cam: CameraInfo, camera_id: str) -> None:
+        """Fully remove camera from pipeline (when not last camera)."""
+        # Block data flow
+        for pad in cam.branch_pads.values():
+            pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, lambda *_: Gst.PadProbeReturn.REMOVE)
+        time.sleep(0.2)
+
+        # Unlink from all branches
+        for b in list(cam.branch_pads.keys()):
+            self._unlink_branch(cam, b, camera_id)
+
+        # Set to NULL and remove
+        cam.bin.set_state(Gst.State.NULL)
+        cam.bin.get_state(STATE_CHANGE_TIMEOUT)
+        self.pipeline.remove(cam.bin)
+
+        # Cleanup tracking
+        self._mapper.remove(camera_id)
+        del self._cameras[camera_id]
+
+        # Wait for GPU decoder cleanup
+        logger.info(f"[CAM] Waiting for GPU decoder cleanup (5s)...")
+        time.sleep(5.0)
 
     def add_camera_to_branch(self, camera_id: str, branch_name: str) -> bool:
         """Add camera to additional branch dynamically."""

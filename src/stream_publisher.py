@@ -321,13 +321,23 @@ class StreamPublisher:
                 logger.info(f"[StreamPublisher] Linked src_{cam.source_id} to stream chain")
 
                 # Sync element states with parent
-                for elem in elements:
-                    elem.sync_state_with_parent()
+                logger.info(f"[StreamPublisher] Syncing element states...")
+                for i, elem in enumerate(elements):
+                    ret = elem.sync_state_with_parent()
+                    logger.debug(f"[StreamPublisher] Element {i}/{len(elements)} ({elem.get_name()}): {ret}")
+                logger.info(f"[StreamPublisher] All elements synced")
 
                 # Resume pipeline
                 if prev_state == Gst.State.PLAYING:
-                    self.pipeline.set_state(Gst.State.PLAYING)
-                    self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
+                    logger.info(f"[StreamPublisher] Resuming pipeline to PLAYING...")
+                    ret = self.pipeline.set_state(Gst.State.PLAYING)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        raise RuntimeError("Pipeline failed to return to PLAYING state")
+
+                    ret2, state, pending = self.pipeline.get_state(STATE_CHANGE_TIMEOUT)
+                    if ret2 == Gst.StateChangeReturn.FAILURE:
+                        raise RuntimeError(f"Pipeline state change failed (current={state.value_nick}, pending={pending.value_nick})")
+                    logger.info(f"[StreamPublisher] Pipeline resumed to {state.value_nick}")
 
                 # Store publish info
                 self._publishers[key] = PublishInfo(

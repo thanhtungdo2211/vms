@@ -31,7 +31,31 @@ docker exec -w /app qv_face bash -c "<commands>"
 
 ## Debug & Test
 
-### Run Pipeline
+### Run Pipeline (ALWAYS Use This Method)
+
+**IMPORTANT: Always use `entry/run_pipeline.sh` to start the pipeline. This script automatically cleans up old processes and ports.**
+
+```bash
+# From host (recommended) - Interactive mode with terminal output
+docker exec -it -w /app qv_face bash entry/run_pipeline.sh
+
+# From host - Background mode with log file
+docker exec -d -w /app qv_face bash -c "bash entry/run_pipeline.sh > /tmp/pipeline.log 2>&1"
+docker exec qv_face tail -f /tmp/pipeline.log
+
+# Inside container (after docker exec -it -w /app qv_face bash)
+bash entry/run_pipeline.sh
+```
+
+**Why use `run_pipeline.sh`?**
+- Auto-kills old Python processes and frees port 8083
+- Prevents "port already in use" errors
+- Ensures clean pipeline restart
+- Safer than manual Python execution
+
+### Run Pipeline (Manual - Not Recommended)
+
+Only use direct Python execution if you need custom configuration:
 
 ```bash
 # Inside container
@@ -39,25 +63,17 @@ python3 entry/test_multi_branch_video.py
 
 # With custom config
 python3 entry/test_multi_branch_video.py --config configs/test-single-branch.yaml
-
-# From host
-docker exec -w /app qv_face python3 entry/test_multi_branch_video.py
 ```
 
-### Background Run (with logs)
+**WARNING: Manual execution may fail if port 8083 is already in use. Use `run_pipeline.sh` instead.**
+
+### Test Scripts
 
 ```bash
-# Start in background
-docker exec -d -w /app qv_face bash -c "python3 entry/test_multi_branch_video.py > /tmp/pipeline.log 2>&1"
+# Simple test: Add camera + Start stream
+./tests/add_remove_readd_stream_cam1.sh
 
-# View logs
-docker exec qv_face tail -f /tmp/pipeline.log
-```
-
-### Full Test Script
-
-```bash
-# From host (outside container)
+# Full test (from host)
 ./entry/full_test_video.sh
 ```
 
@@ -67,9 +83,11 @@ Base URL: `http://localhost:8083`
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/health` | Health check |
+| GET | `/api/health` | Quick health check |
+| GET | `/api/status` | **Detailed pipeline status (debugging)** |
 | GET | `/api/cameras` | List cameras |
 | GET | `/api/branches` | List branches |
+| GET | `/api/operations/{op_id}` | **Get operation result (with errors)** |
 | POST | `/api/cameras` | Add camera |
 | DELETE | `/api/cameras/{id}` | Remove camera |
 | POST | `/api/cameras/{id}/branches/{branch}` | Add to branch |
@@ -78,7 +96,6 @@ Base URL: `http://localhost:8083`
 | POST | `/api/cameras/{id}/branches/{branch}/stream/stop` | Stop stream |
 | GET | `/api/cameras/{id}/branches/{branch}/stream` | Stream status |
 | GET | `/api/streams` | All streams status |
-| GET | `/api/operations/{op_id}` | Operation status |
 | POST | `/api/pipeline/kill` | Remove all cameras |
 | POST | `/api/pipeline/stop` | Stop pipeline |
 
@@ -109,6 +126,27 @@ curl -X POST http://localhost:8083/api/cameras/cam1/branches/detection/stream/st
 
 # List all streams
 curl http://localhost:8083/api/streams
+```
+
+### Debugging APIs (NEW)
+
+```bash
+# Get detailed pipeline status (state, cameras, streams, operations)
+curl http://localhost:8083/api/status | python3 -m json.tool
+
+# Check operation result (includes error details, traceback)
+curl http://localhost:8083/api/operations/{operation_id} | python3 -m json.tool
+
+# Example operation response with error:
+# {
+#   "status": "error",
+#   "operation_type": "stream_start",
+#   "duration": 5.23,
+#   "timestamp": 1234567890.12,
+#   "error": "Pipeline failed to return to PLAYING state",
+#   "error_type": "RuntimeError",
+#   "traceback": "..."
+# }
 ```
 
 ## Project Structure
@@ -153,7 +191,12 @@ docker exec qv_face tail -f /tmp/full_test.log
 ### Kill Pipeline Processes
 
 ```bash
+# Recommended: Use the run_pipeline.sh script (auto cleanup)
+docker exec -w /app qv_face bash entry/run_pipeline.sh
+
+# Manual kill (if needed)
 docker exec qv_face pkill -9 -f 'python.*test_multi'
+docker exec qv_face fuser -k 8083/tcp  # Free port 8083
 ```
 
 ### Check Running Processes
@@ -173,6 +216,14 @@ cd scripts && docker compose restart
 ## Common Issues
 
 1. **Container unhealthy**: Check `docker logs qv_face` for errors
-2. **Port 8083 in use**: Run `lsof -i :8083` and kill the process
+2. **Port 8083 in use**: Use `entry/run_pipeline.sh` (auto cleanup) or manually kill with `docker exec qv_face fuser -k 8083/tcp`
 3. **Pipeline crash**: Check `/tmp/pipeline.log` inside container
 4. **RTSP timeout**: Verify camera URI is reachable from container
+5. **Multiple pipeline instances**: Always use `entry/run_pipeline.sh` which auto-kills old processes before starting
+
+## Best Practices
+
+1. **Always start pipeline via**: `docker exec -it -w /app qv_face bash entry/run_pipeline.sh`
+2. **Run commands in Docker**: Use `docker exec -w /app qv_face` for all operations
+3. **Check logs**: Monitor `/tmp/pipeline.log` for debugging
+4. **Clean restart**: The `run_pipeline.sh` script handles cleanup automatically
