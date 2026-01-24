@@ -277,4 +277,12 @@ Both scripts show warning indicators:
 
 ## License
 
-Proprietary - Internal use only.
+MIT License
+
+## Contact
+
+**QuangVan**
+- Email: vanquang.tpa@gmail.com
+- Phone: 0395077199
+
+For questions, issues, or collaboration inquiries, please reach out via email.
