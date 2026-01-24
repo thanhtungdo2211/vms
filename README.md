@@ -177,6 +177,47 @@ See `docs/` for detailed documentation:
 - [Code Standards](docs/code-standards.md)
 - [System Architecture](docs/system-architecture.md)
 
+## Hardware Monitoring
+
+### Monitor System Resources
+
+The project includes monitoring scripts for different platforms:
+
+**For dGPU (T4, A100, etc.) on Ubuntu with Docker:**
+
+```bash
+# Run inside Docker container
+docker exec -it qv_face bash scripts/monitor_dpu.sh
+
+# Monitors: System RAM, CPU, GPU Util, GPU Memory, GPU Temp
+# Uses: nvidia-smi
+```
+
+**For Jetson (Orin/Xavier) - Direct execution (NO Docker):**
+
+```bash
+# Run directly on Jetson host
+bash scripts/monitor_jetson.sh
+
+# Monitors: CMA Memory, System RAM, CPU, GPU, Temperature
+# Uses: tegrastats
+```
+
+**Platform Comparison:**
+
+| Platform | Script | Tool | GPU Memory | Docker |
+|----------|--------|------|------------|--------|
+| dGPU (T4) | `monitor_dpu.sh` | `nvidia-smi` | Dedicated VRAM | ✅ Yes |
+| Jetson | `monitor_jetson.sh` | `tegrastats` | Shared/Unified | ❌ No |
+
+**Key Differences:**
+- **dGPU**: Runs in Docker, uses dedicated GPU memory
+- **Jetson**: Direct execution, unified memory architecture, CMA monitoring critical for DeepStream
+
+Both scripts show warning indicators:
+- ⚡ Yellow (80-90% usage)
+- ⚠️ Red (>90% usage)
+
 ## Troubleshooting
 
 ### WebRTC Connection Issues
@@ -192,7 +233,9 @@ See `docs/` for detailed documentation:
 ### Low FPS
 - Reduce input resolution via `muxer_width/height`
 - Increase `skip_reid` to reduce SGIE calls
-- Check GPU utilization with `tegrastats`
+- Check GPU utilization:
+  - **dGPU**: `nvidia-smi` or `scripts/monitor_dpu.sh` (in Docker)
+  - **Jetson**: `tegrastats` or `scripts/monitor_jetson.sh` (on host)
 
 ## License
 

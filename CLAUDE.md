@@ -221,9 +221,65 @@ cd scripts && docker compose restart
 4. **RTSP timeout**: Verify camera URI is reachable from container
 5. **Multiple pipeline instances**: Always use `entry/run_pipeline.sh` which auto-kills old processes before starting
 
+## Hardware Monitoring
+
+### Monitor GPU & System Resources
+
+**For dGPU (T4, A100, etc.) on Ubuntu - Run in Docker:**
+
+```bash
+# From host - Monitor GPU inside container
+docker exec -it qv_face bash scripts/monitor_dpu.sh
+
+# What it monitors:
+# - System RAM (used/total GB, %)
+# - CPU Usage (%)
+# - GPU Utilization (%)
+# - GPU Memory (used/total MB, %)
+# - GPU Temperature (°C)
+
+# Warning indicators:
+# ⚡ Yellow (80-90% usage)
+# ⚠️  Red (>90% usage)
+```
+
+**For Jetson (Orin/Xavier) - Run directly (NO Docker):**
+
+```bash
+# Run directly on Jetson host
+bash scripts/monitor_jetson.sh
+
+# What it monitors:
+# - CMA Memory (MB, %) - Important for DeepStream
+# - System RAM (MB, %)
+# - CPU Usage (%)
+# - GPU Usage (%)
+# - Temperature (°C)
+
+# Warning indicators:
+# ⚡ Yellow (80-90% usage)
+# ⚠️  Red (>90% usage)
+```
+
+**Platform Differences:**
+
+| Feature | dGPU (T4) | Jetson (Orin) |
+|---------|-----------|---------------|
+| Execution | Inside Docker | Direct on host (NO Docker) |
+| Tool | `nvidia-smi` | `tegrastats` |
+| GPU Memory | Dedicated VRAM | Shared with system RAM |
+| CMA Memory | N/A | Critical for zero-copy |
+| Script | `monitor_dpu.sh` | `monitor_jetson.sh` |
+
+**Why Jetson doesn't use Docker:**
+- DeepStream requires direct hardware access (tegrastats, CMA)
+- GPU memory is shared with system RAM (unified memory)
+- Performance overhead from containerization
+
 ## Best Practices
 
 1. **Always start pipeline via**: `docker exec -it -w /app qv_face bash entry/run_pipeline.sh`
 2. **Run commands in Docker**: Use `docker exec -w /app qv_face` for all operations
 3. **Check logs**: Monitor `/tmp/pipeline.log` for debugging
 4. **Clean restart**: The `run_pipeline.sh` script handles cleanup automatically
+5. **Monitor resources**: Use appropriate monitoring script for your platform (see Hardware Monitoring section)
