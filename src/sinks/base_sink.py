@@ -40,6 +40,6 @@ class BaseSink(ABC):
         Send event via data channel (optional).
 
         Default implementation is a no-op.
-        Override in sinks that support data channels (e.g., WebRTC).
+        Override in sinks that support data channels.
         """
         pass

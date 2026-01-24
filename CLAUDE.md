@@ -1,4 +1,4 @@
-# Face Stream Pipeline - Project Guide
+# VMSx - VMS Core Pipeline - Project Guide
 
 ## Quick Reference
 

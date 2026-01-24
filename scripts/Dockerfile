@@ -1,5 +1,5 @@
 # ==========================================
-# DeepStream 7.1 Face Recognition + WebRTC
+# VMSx - DeepStream 7.1 VMS Core
 # ==========================================
 FROM nvcr.io/nvidia/deepstream:7.1-triton-multiarch
 

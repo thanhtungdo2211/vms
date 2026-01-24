@@ -1,156 +1,190 @@
-# FACE - Face Recognition Streaming System
+# VMSx - Comprehensive VMS Core
 
-Real-time face recognition with WebRTC streaming for NVIDIA Jetson platforms.
+GPU-accelerated Video Management System core built on NVIDIA DeepStream 7.1.
 
 ## Overview
 
-FACE is a GPU-accelerated face recognition pipeline built on NVIDIA DeepStream 7.1. It detects, tracks, and identifies faces in real-time from video sources, streaming the results to web browsers via WebRTC.
+VMSx is a comprehensive VMS (Video Management System) core leveraging NVIDIA DeepStream SDK. It provides a flexible, multi-branch pipeline architecture for real-time video analytics including object detection, face recognition, tracking, and streaming via RTSP to MediaMTX server.
 
 **Key Features:**
-- Real-time face detection using SCRFD 2.5G
-- Face tracking with NvDCF visual tracker
-- Face recognition using ArcFace ResNet-100
-- Low-latency WebRTC streaming with H.264
-- Browser-based viewer with recognition events
+- **Multi-branch architecture**: Single decode, multiple processing pipelines (detection, recognition, recording)
+- **GPU-accelerated analytics**: Real-time object detection, face detection (SCRFD 2.5G), face recognition (ArcFace ResNet-100)
+- **Advanced tracking**: NvDCF visual tracker with per-camera isolation
+- **Flexible streaming**: Low-latency RTSP output to MediaMTX server with H.264
+- **REST API**: Dynamic camera management (add/remove/configure)
+- **Scalable**: Multi-camera support with hardware-accelerated processing
 
 ## Prerequisites
 
-- NVIDIA Jetson (Orin/Xavier) with JetPack 6.x
+- NVIDIA GPU (T4, A100, etc.) or Jetson (Orin/Xavier)
 - DeepStream SDK 7.1
 - Python 3.10+
 - CUDA 12.6 / TensorRT 10.x
+- MediaMTX server for RTSP streaming
 
 ## Quick Start
 
 ### 1. Setup Environment
 
 ```bash
-# Run Jetson setup script
+# Run setup script (for dGPU, use Docker)
 cd scripts
-bash setup_7_1_jetson.sh
+docker compose up -d
 
-# Generate SSL certificates
-bash genkey.sh
+# For Jetson (direct execution)
+bash setup_7_1_jetson.sh
 ```
 
 ### 2. Configure
 
-Edit `cfg.py` to set:
-- `ws_server`: Your Jetson's IP address
-- `input_uri`: Video source (file path or RTSP URL)
+Edit your YAML config file (e.g., `configs/multi-branch.yaml`) to set:
+- Input camera URIs (RTSP sources)
+- Output RTSP URIs (to MediaMTX server)
+- Branch configurations (detection, recognition)
 
 ### 3. Run
 
 ```bash
-# Terminal 1: Start signaling server
-python3 signalling.py
+# For dGPU (inside Docker container)
+docker exec -it -w /app qv_face bash entry/run_pipeline.sh
 
-# Terminal 2: Open viewer in browser
-# Navigate to view.html (use HTTPS)
-
-# Terminal 3: Start face recognition pipeline
-python3 stream.py
+# For Jetson (direct execution)
+python3 entry/test_multi_branch_video.py
 ```
 
 ## Project Structure
 
 ```
-FACE/
-├── api/                     # REST API for camera management
-│   └── camera_api.py        # CRUD endpoints (aiohttp)
-├── apps/face/               # Face recognition application
-│   ├── database.py          # Feature DB with L2 matching
-│   ├── tracker.py           # Multi-track state machine (voting)
-│   ├── events.py            # Recognition events
-│   ├── display.py           # OSD rendering
-│   └── probes.py            # GStreamer probes
-├── core/                    # Pipeline framework
-│   ├── config.py            # YAML loader with env var expansion
-│   ├── tee_fanout_builder.py # Multi-branch pipeline builder
-│   ├── multibranch_camera_manager.py # Dynamic camera CRUD
-│   ├── camera_bin.py        # Camera container
-│   ├── probe_registry.py    # Probe registration system
-│   └── source_mapper.py     # Track source_id → camera mapping
-├── sinks/                   # Output adapters
-│   ├── base_sink.py         # Abstract interface
-│   ├── fakesink_adapter.py  # Testing sink
-│   ├── filesink_adapter.py  # MP4 recording
-│   └── webrtc/
-│       ├── webrtc_adapter.py  # WebRTC streaming + DataChannel
-│       └── signaling_server.py # WebSocket signaling
-├── bin/                     # Entry points
-│   ├── run_multi_branch.py  # Main: multi-branch pipeline + API
-│   ├── run_face_webrtc.py   # Single-branch face + WebRTC
-│   ├── test_*.py            # Integration tests
-├── configs/                 # Pipeline configurations
-│   ├── face-recognition.yaml  # Single-branch config
-│   ├── multi-camera.yaml      # Legacy multi-camera
-│   └── multi-branch.yaml      # Multi-branch tee architecture
-├── data/face/               # Models and features
-│   ├── models/
-│   │   ├── scrfd640/        # Face detection (PGIE)
-│   │   ├── arcface/         # Face recognition (SGIE)
-│   │   └── NvDCF/           # Tracker config
-│   └── features.json        # Registered face embeddings
-├── scripts/
-│   ├── setup_7_1_jetson.sh  # Environment setup
-│   └── genkey.sh            # SSL certificate generation
-└── docs/                    # Documentation
-    ├── project-overview-pdr.md   # PDR and requirements
-    ├── codebase-summary.md       # Module structure and data flow
-    ├── code-standards.md         # Coding conventions
-    └── system-architecture.md    # Architecture diagrams
+VMSx/
+├── src/                     # Core VMS modules
+│   ├── api/                 # REST API for camera/stream management
+│   │   └── api_server.py    # FastAPI/aiohttp endpoints
+│   ├── camera_manager.py    # Dynamic camera CRUD operations
+│   ├── pipeline_builder.py  # Multi-branch pipeline construction
+│   ├── stream_publisher.py  # RTSP stream management
+│   ├── common.py            # Shared utilities
+│   └── sinks/               # Output adapters
+│       ├── base_sink.py     # Abstract sink interface
+│       ├── fakesink_adapter.py  # Testing sink
+│       └── filesink_adapter.py  # MP4 recording
+├── apps/                    # Analytics applications
+│   ├── detection/           # Object detection processor
+│   └── face/                # Face recognition application
+│       ├── database.py      # Feature DB with L2 matching
+│       ├── tracker.py       # Multi-object tracking with voting
+│       ├── events.py        # Recognition events
+│       ├── display.py       # OSD rendering
+│       └── probes.py        # GStreamer buffer probes
+├── entry/                   # Entry points
+│   ├── test_multi_branch_video.py  # Main pipeline launcher
+│   ├── run_pipeline.sh      # Startup script with cleanup
+│   └── full_test_video.sh   # Integration test script
+├── configs/                 # YAML configurations
+│   ├── multi-branch.yaml    # Multi-branch pipeline config
+│   └── test-*.yaml          # Test configurations
+├── data/                    # Models and data
+│   ├── face/models/         # Face detection/recognition models
+│   │   ├── scrfd640/        # SCRFD face detector (PGIE)
+│   │   ├── arcface/         # ArcFace embeddings (SGIE)
+│   │   └── NvDCF/           # Tracker configuration
+│   └── features.json        # Face database
+├── scripts/                 # DevOps scripts
+│   ├── docker-compose.yml   # Docker deployment
+│   ├── Dockerfile           # Container image
+│   ├── monitor_dpu.sh       # GPU monitoring (dGPU)
+│   ├── monitor_jetson.sh    # System monitoring (Jetson)
+│   ├── setup_7_1_jetson.sh  # Jetson environment setup
+│   └── *.sh                 # Management scripts
+├── tests/                   # Test scripts
+└── docs/                    # Documentation (if exists)
 ```
 
 ## Architecture
 
-**Multi-Branch Tee Fanout** (single decode, zero-copy distribution):
+**Multi-Branch Tee Fanout Pipeline** (single decode, zero-copy distribution):
 
 ```
-Camera → nvurisrcbin (decode) → tee → Branch A (Recognition) → WebRTC
-                                  ↘ Branch B (Detection) → File
+Camera Input → nvurisrcbin (H.264/H.265 decode) → tee (fanout)
+                                                    ├─→ Branch A (Face Recognition) → RTSP (MediaMTX)
+                                                    ├─→ Branch B (Detection Only) → File/RTSP
+                                                    └─→ Branch C (Recording) → MP4
 
-Pipeline Flow:
-  SCRFD (Detection) → NvDCF (Tracking) → ArcFace (Recognition) → Matching
-                                                                      ↓
-                                                          WebRTC DataChannel (Events)
+Each Branch Pipeline:
+  PGIE (Detection) → NvDCF Tracker → SGIE (Classification/Recognition) → OSD → Encoder → Sink
+       ↓
+  Object Metadata → Custom Probes → Events/Analytics
 ```
 
-**Key Features**:
-- Dynamic camera add/remove via REST API
-- Multi-branch processing (recognition, detection, recording)
-- Hardware-accelerated buffer copying prevents inter-branch tearing
-- Streak-based identity confirmation (3+ consecutive matches)
-- Per-camera tracking isolation (no object_id collision)
+**Architecture Highlights**:
 
-See [docs/system-architecture.md](docs/system-architecture.md) for detailed architecture diagrams.
+1. **Dynamic Camera Management**
+   - REST API for runtime camera add/remove
+   - Per-camera pipeline isolation (independent processing)
+   - No pipeline restart required for camera changes
+
+2. **Multi-Branch Processing**
+   - Single video decode, multiple independent processing branches
+   - Hardware-accelerated buffer copy (nvvideoconvert) prevents tearing
+   - Each branch can have different: models, trackers, outputs
+
+3. **GPU-Accelerated Analytics**
+   - PGIE: Primary detection (faces, objects)
+   - SGIE: Secondary classification (face recognition, attributes)
+   - NvDCF Tracker: Visual tracking with per-camera isolation
+
+4. **Flexible Output**
+   - RTSP streaming to MediaMTX (rtspclientsink)
+   - MP4 file recording (filesink)
+   - Configurable bitrate, resolution, framerate
+
+5. **Event System**
+   - Real-time recognition events
+   - Voting-based confirmation (streak threshold)
+   - Per-object tracking with state machines
 
 ## Configuration
 
-Key parameters in `cfg.py`:
+Key parameters in YAML config files (e.g., `configs/multi-branch.yaml`):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `ws_server` | 192.168.6.112 | WebSocket server address |
-| `ws_port` | 8555 | WebSocket port |
+| `uri` | - | Input camera RTSP URI |
+| `output_uri` | - | Output RTSP URI (to MediaMTX) |
+| `bitrate` | 4000000 | H.264 encoding bitrate |
 | `l2_threshold` | 1.20 | Max L2 distance for matching |
 | `vote_threshold` | 3 | Votes needed for confirmation |
 | `vote_window_frames` | 90 | Sliding window size |
 
-## Face Registration
+## Analytics Applications
 
-Add faces to `features.json`:
+### Face Recognition
+
+Add registered faces to `data/features.json`:
 
 ```json
 {
     "PersonName": {
-        "feature": [0.1, 0.2, ...],
+        "feature": [0.1, 0.2, ...],  // 512-dim ArcFace embedding
         "avatar": "<base64_encoded_image>"
     }
 }
 ```
 
-Features are 512-dimensional normalized vectors from ArcFace.
+Features are 512-dimensional normalized L2 vectors from ArcFace ResNet-100.
+
+### Object Detection
+
+Configure detection models in YAML:
+- Primary detector (PGIE): SCRFD, YOLO, etc.
+- Secondary classifier (SGIE): ArcFace, custom models
+- Tracker: NvDCF, DeepSORT, IOU
+
+### Custom Applications
+
+Add custom analytics by:
+1. Creating processor in `apps/<name>/`
+2. Implementing GStreamer probes for metadata extraction
+3. Configuring in YAML branch definition
 
 ## Video Sources
 
@@ -159,23 +193,26 @@ Supported input formats:
 - RTSP streams: `rtsp://user:pass@ip:port/path`
 - HTTP streams: `http://example.com/stream`
 
-## Browser Viewer
+## RTSP Output
 
-The `view.html` viewer provides:
-- 70/30 split layout (video/sidebar)
-- Real-time recognition event feed
-- Auto-reconnection on disconnect
-- Fullscreen support
+The pipeline streams processed video to MediaMTX server via RTSP:
+- Output URI format: `rtsp://<mediamtx-ip>:8554/<stream-name>`
+- Supports multiple concurrent streams (multi-branch)
+- H.264 encoding with configurable bitrate
+- View streams using any RTSP client (VLC, ffplay, etc.)
 
-Access via: `https://<jetson-ip>:8555` (after opening view.html)
+## API Reference
 
-## Documentation
+VMSx provides REST API for dynamic camera and stream management. See `CLAUDE.md` for complete API documentation.
 
-See `docs/` for detailed documentation:
-- [Project Overview & PDR](docs/project-overview-pdr.md)
-- [Codebase Summary](docs/codebase-summary.md)
-- [Code Standards](docs/code-standards.md)
-- [System Architecture](docs/system-architecture.md)
+**Key Endpoints:**
+- `GET /api/health` - Health check
+- `GET /api/status` - Pipeline status
+- `POST /api/cameras` - Add camera
+- `POST /api/cameras/{id}/branches/{branch}/stream/start` - Start RTSP stream
+- `DELETE /api/cameras/{id}` - Remove camera
+
+Base URL: `http://localhost:8083`
 
 ## Hardware Monitoring
 
@@ -220,10 +257,11 @@ Both scripts show warning indicators:
 
 ## Troubleshooting
 
-### WebRTC Connection Issues
-- Ensure SSL certificates are generated
-- Check firewall allows port 8555
-- Verify STUN server is reachable
+### RTSP Streaming Issues
+- Verify MediaMTX server is running and accessible
+- Check output URI is correctly formatted
+- Ensure network allows RTSP port (default 8554)
+- Test with RTSP client: `ffplay rtsp://<ip>:8554/<stream>`
 
 ### Recognition Not Working
 - Check `features.json` is properly formatted

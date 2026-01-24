@@ -1,5 +1,5 @@
 #!/bin/bash
-# View logs of the Face Recognition WebRTC Stream containers
+# View logs of the VMSx VMS Core containers
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"

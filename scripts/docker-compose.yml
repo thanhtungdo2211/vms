@@ -1,4 +1,4 @@
-# Docker Compose v2 configuration for Face Recognition WebRTC Stream
+# Docker Compose v2 configuration for VMSx VMS Core
 services:
   qv_face:
     build:
@@ -36,8 +36,6 @@ services:
       - GST_DEBUG=${GST_DEBUG:-2,v4l2*:1}
       - PYTHONUNBUFFERED=1
       - DISPLAY=${DISPLAY:-:0}
-      - WS_SERVER=${WS_SERVER:-192.168.6.16}
-      - WS_PORT=${WS_PORT:-8555}
 
     # Interactive mode for debugging
     stdin_open: true
@@ -45,7 +43,7 @@ services:
 
     # Health check
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${WS_PORT:-8555}/health", "||", "exit", "1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8083/api/health", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3
