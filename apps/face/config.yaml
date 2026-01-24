@@ -26,9 +26,6 @@ elements:
   - type: nvtracker
     config_file: "data/face/models/NvDCF/config_tracker.txt"
     probes: {src: tracker_probe}
-  - type: nvvideoconvert
-  - type: capsfilter
-    caps: "video/x-raw(memory:NVMM), format=RGBA"
   - type: nvinfer
     config_file: "data/face/models/arcface/infer.txt"
     probes: {src: sgie_probe, sink: recognition_fps_probe}

@@ -154,16 +154,32 @@ class StreamPublisher:
     def _create_stream_chain(self, uri: str, bitrate: int) -> list:
         """Create RTSP sink element chain with OSD for per-camera streaming.
 
-        Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter → (nvvidconv2) → encoder → h264parse → rtspclientsink
+        Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter(I420/NV12) → encoder → h264parse → rtspclientsink
+
+        Notes:
+        - nvstreamdemux outputs video/x-raw(memory:NVMM),format=RGBA or NV12
+        - nvdsosd accepts and outputs RGBA or NV12
+        - nvvideoconvert converts to encoder-specific format
+        - Output capsfilter: I420 for x264enc (Jetson), NV12 for nvv4l2h264enc (dGPU)
         """
         platform = detect_platform()
         elements = []
 
-        # Queue
+        # Queue - accepts any format from nvstreamdemux
         queue = make_element("queue", None)
         elements.append(queue)
 
+        # nvvideoconvert - normalize format before OSD
+        # Handles NV12/RGBA from nvstreamdemux, outputs NV12 for OSD
+        # This prevents GST_PAD_LINK_NOFORMAT by doing format conversion early
+        conv_input_props = get_nvvidconv_props()
+        if platform.is_jetson:
+            conv_input_props["copy-hw"] = 2
+        conv_input = make_element("nvvideoconvert", None, conv_input_props)
+        elements.append(conv_input)
+
         # OSD - draw annotations (CPU mode on Jetson to avoid GPU memory pressure)
+        # Accepts NV12 from nvvideoconvert
         osd = make_element("nvdsosd", None, {
             "process-mode": 0 if platform.is_jetson else 1,
             "display-text": 1
@@ -173,26 +189,25 @@ class StreamPublisher:
         # Get encoder type to determine format requirements
         enc_factory, enc_props = get_encoder_element(bitrate)
 
-        # nvvideoconvert - needed to handle format conversion (RGBA → NV12 or I420)
-        # Some branches (e.g., recognition) output RGBA from demux
+        # nvvideoconvert - needed to handle format conversion
+        # Input: NV12 from OSD → Output: I420 for x264enc (software) or NV12 for nvv4l2h264enc (hardware)
         conv_props = get_nvvidconv_props()
         if platform.is_jetson:
             conv_props["copy-hw"] = 2
         conv = make_element("nvvideoconvert", None, conv_props)
         elements.append(conv)
 
-        # Hardware encoder (nvv4l2h264enc) needs video/x-raw(memory:NVMM),format=NV12
-        # Software encoder (x264enc) needs plain video/x-raw,format=I420
+        # Format selection based on encoder type
+        # NOTE: nvstreamdemux outputs NV12, which works best with x264enc on Jetson
         if enc_factory == "nvv4l2h264enc":
-            # Hardware path: nvdsosd → nvvidconv → NV12 → nvv4l2h264enc
-            # NV12 prevents color artifacts and is native format for H.264 encoder
+            # Hardware encoder path (dGPU): Keep NV12 with NVMM memory
             caps = make_element("capsfilter", None, {
                 "caps": Gst.Caps.from_string("video/x-raw(memory:NVMM),format=NV12")
             })
             elements.append(caps)
         else:
-            # Software path: nvdsosd → nvvidconv → I420 (strip NVMM) → x264enc
-            # Caps filter - Software encoder needs plain I420 (no NVMM)
+            # Software encoder path (Jetson x264enc): Convert NV12 → I420, strip NVMM
+            # x264enc requires plain I420 format without NVMM memory
             caps = make_element("capsfilter", None, {
                 "caps": Gst.Caps.from_string("video/x-raw,format=I420")
             })
@@ -290,25 +305,30 @@ class StreamPublisher:
                 if ret != Gst.PadLinkReturn.OK:
                     raise RuntimeError(f"Failed to link to rtspclientsink: {ret}")
 
+                # CRITICAL: Sync element states BEFORE linking to demux
+                # Elements must be in same state as pipeline for caps negotiation to work
+                logger.info(f"[StreamPublisher] Syncing element states to {prev_state.value_nick} BEFORE linking...")
+                for elem in elements:
+                    # Sync each element to current pipeline state (NULL->READY->PAUSED->PLAYING)
+                    elem.sync_state_with_parent()
+                logger.info(f"[StreamPublisher] All elements synced to {prev_state.value_nick}")
+
                 # Get demux pad
                 demux_src = self._get_demux_pad(demux, cam.source_id)
                 if not demux_src:
                     raise RuntimeError(f"Could not get demux pad src_{cam.source_id}")
 
+                # Log demux pad caps for debugging
+                demux_caps = demux_src.get_current_caps() or demux_src.query_caps(None)
+                logger.info(f"[StreamPublisher] Demux pad caps: {demux_caps.to_string() if demux_caps else 'None'}")
+
                 queue_sink = elements[0].get_static_pad("sink")
 
-                # Link to demux
+                # Link to demux (now elements are in PLAYING state, caps can negotiate)
                 link_result = demux_src.link(queue_sink)
                 if link_result != Gst.PadLinkReturn.OK:
                     raise RuntimeError(f"Failed to link demux pad: {link_result}")
                 logger.info(f"[StreamPublisher] Linked src_{cam.source_id} to stream chain")
-
-                # Sync element states incrementally to pipeline state
-                logger.info(f"[StreamPublisher] Syncing element states to {prev_state.value_nick}...")
-                for elem in elements:
-                    # Sync each element to current pipeline state (NULL->READY->PAUSED->PLAYING)
-                    elem.sync_state_with_parent()
-                logger.info(f"[StreamPublisher] All elements synced to {prev_state.value_nick}")
 
                 # Store publish info
                 self._publishers[key] = PublishInfo(
@@ -331,10 +351,21 @@ class StreamPublisher:
                 return False
 
     def _cleanup_elements(self, elements: list) -> None:
-        """Cleanup elements on error."""
+        """Cleanup elements on error with proper EOS and memory release."""
+        # Send EOS to flush remaining buffers from NVMM/CMA memory
+        for elem in elements:
+            try:
+                elem.send_event(Gst.Event.new_eos())
+            except:
+                pass
+
+        time.sleep(0.2)  # Wait for EOS to propagate
+
+        # Now safely set to NULL and remove
         for elem in elements:
             try:
                 elem.set_state(Gst.State.NULL)
+                elem.get_state(STATE_CHANGE_TIMEOUT)
                 self.pipeline.remove(elem)
             except:
                 pass
@@ -380,11 +411,24 @@ class StreamPublisher:
 
                 time.sleep(0.1)
 
+                # Send EOS to first element to flush CMA buffers
+                logger.info(f"[StreamPublisher] Sending EOS to flush buffers...")
+                if elements:
+                    elements[0].send_event(Gst.Event.new_eos())
+                    time.sleep(0.3)  # Wait for EOS to propagate through chain
+
                 # Set elements to NULL and remove
                 for elem in reversed(elements):
                     elem.set_state(Gst.State.NULL)
                     elem.get_state(STATE_CHANGE_TIMEOUT)
                     self.pipeline.remove(elem)
+
+                # CRITICAL: Release demux pad to free CMA memory
+                if demux_pad:
+                    demux = self._get_demux(branch_name)
+                    if demux:
+                        demux.release_request_pad(demux_pad)
+                        logger.info(f"[StreamPublisher] Released demux pad src_{pub.source_id}")
 
                 del self._publishers[key]
                 logger.info(f"[StreamPublisher] Stopped {camera_id}/{branch_name}")

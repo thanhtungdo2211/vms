@@ -61,7 +61,7 @@ def get_encoder_element(bitrate: int) -> Tuple[str, dict]:
 
     return (
         "x264enc",
-        {"bitrate": bitrate // 1000, "speed-preset": "medium",
+        {"bitrate": bitrate // 1000, "speed-preset": "ultrafast",
          "tune": "zerolatency", "threads": 4, "bframes": 0, 
          "key-int-max": 30, 
          }
