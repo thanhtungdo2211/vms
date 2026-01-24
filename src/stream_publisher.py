@@ -154,7 +154,7 @@ class StreamPublisher:
     def _create_stream_chain(self, uri: str, bitrate: int) -> list:
         """Create RTSP sink element chain with OSD for per-camera streaming.
 
-        Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter → encoder → h264parse → rtspclientsink
+        Pipeline: queue → nvdsosd → nvvideoconvert → capsfilter → (nvvidconv2) → encoder → h264parse → rtspclientsink
         """
         platform = detect_platform()
         elements = []
@@ -170,20 +170,35 @@ class StreamPublisher:
         })
         elements.append(osd)
 
+        # Get encoder type to determine format requirements
+        enc_factory, enc_props = get_encoder_element(bitrate)
+
+        # nvvideoconvert - needed to handle format conversion (RGBA → NV12 or I420)
+        # Some branches (e.g., recognition) output RGBA from demux
         conv_props = get_nvvidconv_props()
         if platform.is_jetson:
-            conv_props['copy-hw'] = 2
+            conv_props["copy-hw"] = 2
         conv = make_element("nvvideoconvert", None, conv_props)
         elements.append(conv)
 
-        # Caps filter - encoder needs I420 format
-        caps = make_element("capsfilter", None, {
-            "caps": Gst.Caps.from_string("video/x-raw,format=I420")
-        })
-        elements.append(caps)
+        # Hardware encoder (nvv4l2h264enc) needs video/x-raw(memory:NVMM),format=NV12
+        # Software encoder (x264enc) needs plain video/x-raw,format=I420
+        if enc_factory == "nvv4l2h264enc":
+            # Hardware path: nvdsosd → nvvidconv → NV12 → nvv4l2h264enc
+            # NV12 prevents color artifacts and is native format for H.264 encoder
+            caps = make_element("capsfilter", None, {
+                "caps": Gst.Caps.from_string("video/x-raw(memory:NVMM),format=NV12")
+            })
+            elements.append(caps)
+        else:
+            # Software path: nvdsosd → nvvidconv → I420 (strip NVMM) → x264enc
+            # Caps filter - Software encoder needs plain I420 (no NVMM)
+            caps = make_element("capsfilter", None, {
+                "caps": Gst.Caps.from_string("video/x-raw,format=I420")
+            })
+            elements.append(caps)
 
         # H264 encoder - platform-optimized
-        enc_factory, enc_props = get_encoder_element(bitrate)
         enc = make_element(enc_factory, None, enc_props)
         elements.append(enc)
         logger.info(f"[StreamPublisher] Using encoder: {enc_factory} ({platform.name})")

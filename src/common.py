@@ -39,7 +39,7 @@ def detect_platform() -> PlatformInfo:
     is_jetson = os.path.exists("/etc/nv_tegra_release") or os.path.exists("/proc/device-tree/model")
     if is_jetson:
         return PlatformInfo(True, "jetson", 0, "", 2)
-    return PlatformInfo(False, "dgpu", 3, "", 1)
+    return PlatformInfo(False, "dgpu", 3, "nvv4l2h264enc", 1)
 
 
 def get_encoder_element(bitrate: int) -> Tuple[str, dict]:
@@ -47,18 +47,23 @@ def get_encoder_element(bitrate: int) -> Tuple[str, dict]:
     platform = detect_platform()
 
     if platform.hw_encoder and Gst.ElementFactory.find(platform.hw_encoder):
-        return (
-            platform.hw_encoder,
-            {"bitrate": bitrate, "profile": 1, "iframeinterval": 30}
-        )
+        # nvv4l2h264enc properties differ between Jetson and dGPU
+        props = {
+            "bitrate": bitrate,
+            "iframeinterval": 30,
+        }
+        if platform.is_jetson:
+            # Jetson supports profile property (0=baseline, 1=main, 2=high)
+            props["profile"] = 1
+        # dGPU's nvv4l2h264enc doesn't support profile/preset-level via GStreamer
+        # Only bitrate and iframeinterval are universally supported
+        return (platform.hw_encoder, props)
 
     return (
         "x264enc",
-        {"bitrate": bitrate // 1000, "speed-preset": "ultrafast",
+        {"bitrate": bitrate // 1000, "speed-preset": "medium",
          "tune": "zerolatency", "threads": 4, "bframes": 0, 
          "key-int-max": 30, 
-        #  "vbv-buf-capacity": 200, 
-        #  "option-string": "aud=1:slice-max-size=1316"
          }
     )
 

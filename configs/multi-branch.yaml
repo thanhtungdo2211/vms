@@ -12,4 +12,4 @@ pipeline:
     # fire_detection: apps/fire_detection/config.yaml
 
     recognition: apps/face/config.yaml
-    detection: apps/detection/config.yaml
+    #detection: apps/detection/config.yaml

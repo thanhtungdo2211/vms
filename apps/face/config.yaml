@@ -21,17 +21,17 @@ muxer:
 # Architecture: mux → PGIE → Tracker → SGIE → nvstreamdemux → (per-cam: OSD → enc → RTSP)
 elements:
   - type: queue
-  - type: nvvideoconvert
-  - type: capsfilter
-    caps: "video/x-raw(memory:NVMM), format=RGBA"
   - type: nvinfer
     config_file: "data/face/models/scrfd640/infer.txt"
   - type: nvtracker
     config_file: "data/face/models/NvDCF/config_tracker.txt"
     probes: {src: tracker_probe}
+  - type: nvvideoconvert
+  - type: capsfilter
+    caps: "video/x-raw(memory:NVMM), format=RGBA"
   - type: nvinfer
     config_file: "data/face/models/arcface/infer.txt"
-    probes: {src: sgie_probe}
+    probes: {src: sgie_probe, sink: recognition_fps_probe}
   - type: nvstreamdemux
 
   
