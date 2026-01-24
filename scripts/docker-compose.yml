@@ -1,10 +1,10 @@
 # Docker Compose v2 configuration for Face Recognition WebRTC Stream
 services:
-  face-stream:
+  qv_face:
     build:
       context: ..
       dockerfile: scripts/Dockerfile
-    container_name: face-stream
+    container_name: qv_face
     restart: unless-stopped
     env_file:
       - .env
