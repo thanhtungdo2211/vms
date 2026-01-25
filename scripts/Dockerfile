@@ -68,7 +68,3 @@ RUN pip3 install --no-cache-dir \
 # Install additional requirements
 COPY scripts/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
-
-# Build custom gst-nvinfer plugin (auto-detects platform: Jetson vs dGPU)
-COPY data/gst-plugins/gst-nvinfer /tmp/gst-nvinfer
-RUN cd /tmp/gst-nvinfer && chmod +x build.sh && ./build.sh install && rm -rf /tmp/gst-nvinfer

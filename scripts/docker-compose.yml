@@ -1,10 +1,10 @@
 # Docker Compose v2 configuration for VMSx VMS Core
 services:
-  qv_face:
+  vmsx:
     build:
       context: ..
       dockerfile: scripts/Dockerfile
-    container_name: qv_face
+    container_name: vmsx
     restart: unless-stopped
     env_file:
       - .env

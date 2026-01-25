@@ -4,7 +4,7 @@
 
 | Item | Value |
 |------|-------|
-| Container | `qv_face` |
+| Container | `vmsx` |
 | Host Path | `/home/mq/disk2T/quangnv/rtc_events` |
 | Container Path | `/app` |
 | API Port | `8083` |
@@ -16,17 +16,17 @@
 ### Enter Container (Interactive Shell)
 
 ```bash
-docker exec -it -w /app qv_face bash
+docker exec -it -w /app vmsx bash
 ```
 
 ### Run Commands Inside Container
 
 ```bash
 # Single command
-docker exec -w /app qv_face <command>
+docker exec -w /app vmsx <command>
 
 # With bash
-docker exec -w /app qv_face bash -c "<commands>"
+docker exec -w /app vmsx bash -c "<commands>"
 ```
 
 ## Debug & Test
@@ -37,13 +37,13 @@ docker exec -w /app qv_face bash -c "<commands>"
 
 ```bash
 # From host (recommended) - Interactive mode with terminal output
-docker exec -it -w /app qv_face bash entry/run_pipeline.sh
+docker exec -it -w /app vmsx bash entry/run_pipeline.sh
 
 # From host - Background mode with log file
-docker exec -d -w /app qv_face bash -c "bash entry/run_pipeline.sh > /tmp/pipeline.log 2>&1"
-docker exec qv_face tail -f /tmp/pipeline.log
+docker exec -d -w /app vmsx bash -c "bash entry/run_pipeline.sh > /tmp/pipeline.log 2>&1"
+docker exec vmsx tail -f /tmp/pipeline.log
 
-# Inside container (after docker exec -it -w /app qv_face bash)
+# Inside container (after docker exec -it -w /app vmsx bash)
 bash entry/run_pipeline.sh
 ```
 
@@ -174,35 +174,35 @@ curl http://localhost:8083/api/operations/{operation_id} | python3 -m json.tool
 ### Check Container Status
 
 ```bash
-docker ps -a --filter "name=qv_face"
+docker ps -a --filter "name=vmsx"
 ```
 
 ### View Logs
 
 ```bash
 # Container logs
-docker logs qv_face --tail 100
+docker logs vmsx --tail 100
 
 # Pipeline logs
-docker exec qv_face tail -f /tmp/pipeline.log
-docker exec qv_face tail -f /tmp/full_test.log
+docker exec vmsx tail -f /tmp/pipeline.log
+docker exec vmsx tail -f /tmp/full_test.log
 ```
 
 ### Kill Pipeline Processes
 
 ```bash
 # Recommended: Use the run_pipeline.sh script (auto cleanup)
-docker exec -w /app qv_face bash entry/run_pipeline.sh
+docker exec -w /app vmsx bash entry/run_pipeline.sh
 
 # Manual kill (if needed)
-docker exec qv_face pkill -9 -f 'python.*test_multi'
-docker exec qv_face fuser -k 8083/tcp  # Free port 8083
+docker exec vmsx pkill -9 -f 'python.*test_multi'
+docker exec vmsx fuser -k 8083/tcp  # Free port 8083
 ```
 
 ### Check Running Processes
 
 ```bash
-docker exec qv_face ps aux | grep python
+docker exec vmsx ps aux | grep python
 ```
 
 ### Container Restart
@@ -215,8 +215,8 @@ cd scripts && docker compose restart
 
 ## Common Issues
 
-1. **Container unhealthy**: Check `docker logs qv_face` for errors
-2. **Port 8083 in use**: Use `entry/run_pipeline.sh` (auto cleanup) or manually kill with `docker exec qv_face fuser -k 8083/tcp`
+1. **Container unhealthy**: Check `docker logs vmsx` for errors
+2. **Port 8083 in use**: Use `entry/run_pipeline.sh` (auto cleanup) or manually kill with `docker exec vmsx fuser -k 8083/tcp`
 3. **Pipeline crash**: Check `/tmp/pipeline.log` inside container
 4. **RTSP timeout**: Verify camera URI is reachable from container
 5. **Multiple pipeline instances**: Always use `entry/run_pipeline.sh` which auto-kills old processes before starting
@@ -229,7 +229,7 @@ cd scripts && docker compose restart
 
 ```bash
 # From host - Monitor GPU inside container
-docker exec -it qv_face bash scripts/monitor_dpu.sh
+docker exec -it vmsx bash scripts/monitor_dpu.sh
 
 # What it monitors:
 # - System RAM (used/total GB, %)
@@ -278,8 +278,8 @@ bash scripts/monitor_jetson.sh
 
 ## Best Practices
 
-1. **Always start pipeline via**: `docker exec -it -w /app qv_face bash entry/run_pipeline.sh`
-2. **Run commands in Docker**: Use `docker exec -w /app qv_face` for all operations
+1. **Always start pipeline via**: `docker exec -it -w /app vmsx bash entry/run_pipeline.sh`
+2. **Run commands in Docker**: Use `docker exec -w /app vmsx` for all operations
 3. **Check logs**: Monitor `/tmp/pipeline.log` for debugging
 4. **Clean restart**: The `run_pipeline.sh` script handles cleanup automatically
 5. **Monitor resources**: Use appropriate monitoring script for your platform (see Hardware Monitoring section)

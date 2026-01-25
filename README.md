@@ -46,7 +46,7 @@ Edit your YAML config file (e.g., `configs/multi-branch.yaml`) to set:
 
 ```bash
 # For dGPU (inside Docker container)
-docker exec -it -w /app qv_face bash entry/run_pipeline.sh
+docker exec -it -w /app vmsx bash entry/run_pipeline.sh
 
 # For Jetson (direct execution)
 python3 entry/test_multi_branch_video.py
@@ -224,7 +224,7 @@ The project includes monitoring scripts for different platforms:
 
 ```bash
 # Run inside Docker container
-docker exec -it qv_face bash scripts/monitor_dpu.sh
+docker exec -it vmsx bash scripts/monitor_dpu.sh
 
 # Monitors: System RAM, CPU, GPU Util, GPU Memory, GPU Temp
 # Uses: nvidia-smi
