@@ -7,9 +7,9 @@
 #   4. Start streaming cam1 detection to rtsp://152.42.221.89:8554/cam1_detection
 
 CAMERA_URI="rtsp://192.168.6.14:8554/testface"
-STREAM_SERVER="152.42.221.89"
+STREAM_SERVER="143.198.198.52"
 STREAM_PORT="8554"
-STREAM_NAME="cam1_detection_2"
+STREAM_NAME="cam1_detection"
 STREAM_URI="rtsp://${STREAM_SERVER}:${STREAM_PORT}/${STREAM_NAME}"
 
 echo "============================================================"

@@ -132,8 +132,8 @@ class MultibranchCameraManager:
             "disable-audio": True,
             "source-id": source_id,
             "cudadec-memtype": 0,
-            "num-extra-surfaces": 2,
-            "latency": 500,
+            "num-extra-surfaces": 0,
+            "latency": 100,
             "drop-frame-interval": 0
         })
         bin_elem.add(source)
