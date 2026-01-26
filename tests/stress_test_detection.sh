@@ -7,7 +7,7 @@
 #   4. Stream cam1 detection to RTSP server
 
 CAMERA_URI="rtsp://192.168.6.14:8554/testface"
-STREAM_SERVER="152.42.221.89"
+STREAM_SERVER="143.198.198.52"
 STREAM_PORT="8554"
 STREAM_NAME_CAM1="cam1_detection"
 STREAM_NAME_CAM2="cam2_detection"

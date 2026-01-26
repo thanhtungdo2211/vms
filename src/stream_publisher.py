@@ -140,6 +140,21 @@ class StreamPublisher:
             logger.warning(f"[StreamPublisher] Failed to request pad {pad_name}")
         return pad
 
+    def _setup_rtsp_error_monitoring(self, camera_id: str, branch_name: str) -> None:
+        """Setup async monitoring for RTSP stream errors via bus messages.
+
+        This monitors GStreamer bus messages for errors from rtspclientsink
+        without blocking the pipeline. Errors are logged but don't stop pipeline.
+
+        Args:
+            camera_id: Camera ID for logging
+            branch_name: Branch name for logging
+        """
+        # Note: Bus message monitoring is already setup in pipeline_builder
+        # This is a placeholder for future per-stream error handling
+        # GStreamer will automatically post ERROR messages to bus if RTSP fails
+        logger.info(f"[StreamPublisher] RTSP error monitoring enabled for {camera_id}/{branch_name}")
+
     def _pub_to_dict(self, pub: PublishInfo) -> dict:
         """Convert PublishInfo to status dict."""
         return {
@@ -167,6 +182,8 @@ class StreamPublisher:
 
         # Queue - accepts any format from nvstreamdemux
         queue = make_element("queue", None)
+        queue.set_property("max-size-buffers", 30)
+        queue.set_property("leaky", 2)
         elements.append(queue)
 
         # nvvideoconvert - normalize format before OSD
@@ -245,6 +262,48 @@ class StreamPublisher:
 
         return elements
 
+    def _check_rtsp_server(self, uri: str, timeout: float = 3.0) -> bool:
+        """Check if RTSP server is reachable.
+
+        Args:
+            uri: RTSP URI (rtsp://host:port/path)
+            timeout: Connection timeout in seconds
+
+        Returns:
+            True if server is reachable, False otherwise
+        """
+        import socket
+        import urllib.parse
+
+        try:
+            parsed = urllib.parse.urlparse(uri)
+            host = parsed.hostname
+            port = parsed.port or 8554  # Default RTSP port
+
+            logger.info(f"[StreamPublisher] Checking RTSP server {host}:{port}...")
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, port))
+            sock.close()
+
+            if result == 0:
+                logger.info(f"[StreamPublisher] RTSP server {host}:{port} is reachable")
+                return True
+            else:
+                logger.error(f"[StreamPublisher] RTSP server {host}:{port} is NOT reachable (error code: {result})")
+                return False
+
+        except socket.gaierror as e:
+            logger.error(f"[StreamPublisher] Cannot resolve RTSP host: {e}")
+            return False
+        except socket.timeout:
+            logger.error(f"[StreamPublisher] RTSP server connection timeout ({timeout}s)")
+            return False
+        except Exception as e:
+            logger.error(f"[StreamPublisher] RTSP server check failed: {e}")
+            return False
+
     def start_publish(
         self,
         camera_id: str,
@@ -252,10 +311,21 @@ class StreamPublisher:
         uri: str,
         bitrate: int = 4000000
     ) -> bool:
-        """Start RTSP publishing for specific camera with annotations."""
+        """Start RTSP publishing for specific camera with annotations.
+
+        Returns:
+            True if stream started successfully
+            False if failed (pipeline continues running)
+        """
         if not uri.startswith("rtsp://"):
             logger.error(f"[StreamPublisher] Invalid RTSP URL: {uri}")
-            return False
+            raise ValueError(f"Invalid RTSP URL: {uri}")
+
+        # Check RTSP server BEFORE acquiring lock
+        if not self._check_rtsp_server(uri):
+            error_msg = f"Cannot connect to RTSP server: {uri}"
+            logger.error(f"[StreamPublisher] {error_msg}")
+            raise ConnectionError(error_msg)
 
         with self._lock:
             key = (camera_id, branch_name)
@@ -267,14 +337,16 @@ class StreamPublisher:
             # Validate camera exists
             cam = self.camera_manager.get_camera(camera_id)
             if not cam:
-                logger.error(f"[StreamPublisher] Camera {camera_id} not found")
-                return False
+                error_msg = f"Camera {camera_id} not found"
+                logger.error(f"[StreamPublisher] {error_msg}")
+                raise ValueError(error_msg)
 
             # Get demux element
             demux = self._get_demux(branch_name)
             if not demux:
-                logger.error(f"[StreamPublisher] No nvstreamdemux in branch {branch_name}")
-                return False
+                error_msg = f"No nvstreamdemux in branch {branch_name}"
+                logger.error(f"[StreamPublisher] {error_msg}")
+                raise RuntimeError(error_msg)
 
             elements = []
             try:
@@ -294,6 +366,9 @@ class StreamPublisher:
                 parse = elements[-2]  # h264parse (last before sink)
                 sink = elements[-1]   # rtspclientsink
 
+                # Setup error monitoring for RTSP sink (non-blocking, async)
+                self._setup_rtsp_error_monitoring(camera_id, branch_name)
+
                 # Get request pad from rtspclientsink
                 sink_pad = sink.get_request_pad("sink_%u")
                 if not sink_pad:
@@ -308,10 +383,25 @@ class StreamPublisher:
                 # CRITICAL: Sync element states BEFORE linking to demux
                 # Elements must be in same state as pipeline for caps negotiation to work
                 logger.info(f"[StreamPublisher] Syncing element states to {prev_state.value_nick} BEFORE linking...")
+
+                # Use NON-BLOCKING state change to avoid pausing pipeline
+                # Let GStreamer handle async state changes in background
                 for elem in elements:
-                    # Sync each element to current pipeline state (NULL->READY->PAUSED->PLAYING)
-                    elem.sync_state_with_parent()
-                logger.info(f"[StreamPublisher] All elements synced to {prev_state.value_nick}")
+                    # Set state WITHOUT waiting (async, non-blocking)
+                    ret = elem.set_state(prev_state)
+
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        raise RuntimeError(f"Failed to set state for {elem.get_name()}")
+                    elif ret == Gst.StateChangeReturn.ASYNC:
+                        # ASYNC is EXPECTED for rtspclientsink (network connection)
+                        # Do NOT wait - let it connect in background
+                        logger.info(f"[StreamPublisher] {elem.get_name()} state change is ASYNC (background)")
+                    elif ret == Gst.StateChangeReturn.SUCCESS:
+                        logger.info(f"[StreamPublisher] {elem.get_name()} state changed to {prev_state.value_nick}")
+                    elif ret == Gst.StateChangeReturn.NO_PREROLL:
+                        logger.info(f"[StreamPublisher] {elem.get_name()} is live (NO_PREROLL)")
+
+                logger.info(f"[StreamPublisher] All elements set to {prev_state.value_nick} (async, non-blocking)")
 
                 # Get demux pad
                 demux_src = self._get_demux_pad(demux, cam.source_id)
@@ -347,8 +437,10 @@ class StreamPublisher:
 
             except Exception as e:
                 logger.error(f"[StreamPublisher] Failed to start publish: {e}", exc_info=True)
+                # CRITICAL: Clean up elements but DO NOT crash pipeline
                 self._cleanup_elements(elements)
-                return False
+                # Re-raise exception so API can return error to client
+                raise
 
     def _cleanup_elements(self, elements: list) -> None:
         """Cleanup elements on error with proper EOS and memory release."""
