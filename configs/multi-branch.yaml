@@ -1,15 +1,15 @@
 camera_api:
   host: "${API_HOST:0.0.0.0}"
-  port: "${API_PORT:8083}"
+  port: "${API_PORT:8085}"
 
 pipeline:
   name: multi-branch-tee-pipeline
   branches:
     # detection: apps/detection/config.yaml
-    # recognition: apps/face/config.yaml
+    recognition: apps/face/config.yaml
     # plate_recognition: apps/plate/config.yaml
     # area_monitoring: apps/area_monitoring/config.yaml
     # fire_detection: apps/fire_detection/config.yaml
 
     #recognition: apps/face/config.yaml
-    detection: apps/detection/config.yaml
+    # detection: apps/detection/config.yaml

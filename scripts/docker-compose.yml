@@ -4,7 +4,7 @@ services:
     build:
       context: ..
       dockerfile: scripts/Dockerfile
-    container_name: vmsx
+    container_name: vmsx-face-spa
     restart: unless-stopped
     env_file:
       - .env
@@ -27,7 +27,7 @@ services:
     volumes:
       # Mount project directory to both /app and original path for compatibility
       - ..:/app
-      - /home/mq/disk2T/quangnv/face:/home/mq/disk2T/quangnv/face
+      # - /home/mq/disk2T/quangnv/face:/home/mq/disk2T/quangnv/face
 
     # Environment variables (from .env + defaults)
     environment:
