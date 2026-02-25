@@ -21,6 +21,10 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Callable, Optional, List, Tuple
 
 import numpy as np
+import cv2
+import pyds
+from datetime import datetime
+
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
@@ -28,6 +32,7 @@ from gi.repository import Gst, GLib
 from src.processor_registry import ProcessorRegistry
 from src.sinks.base_sink import BaseSink
 from src.common import BatchIterator, extract_embedding, get_batch_meta, fps_probe_factory, IntervalRunner
+from apps.face.http_event_sender import HttpEventSender
 
 # Database imports
 try:
@@ -66,6 +71,56 @@ FONT_NAME = "Serif"
 
 # Face-specific constants
 SKIP_SGIE_COMPONENT_ID = 100
+
+# Image save directories
+CROP_FACE_DIR = "data/face/crop-face"
+FULL_FRAME_DIR = "data/face/full-frame"
+
+
+# =============================================================================
+# Frame Extraction Helpers
+# =============================================================================
+
+def extract_frame(gst_buffer, frame_meta) -> Optional[np.ndarray]:
+    """Extract BGR numpy frame from GStreamer buffer. Returns None on failure."""
+    batch_id = frame_meta.batch_id
+    try:
+        n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), batch_id)
+        frame_copy = np.array(n_frame, copy=True, order='C')
+        frame_copy = cv2.cvtColor(frame_copy, cv2.COLOR_RGBA2BGR)
+        pyds.unmap_nvds_buf_surface(hash(gst_buffer), batch_id)
+        return frame_copy
+    except Exception as e:
+        print(f"[ExtractFrame] ERROR batch_id={batch_id}: {e}")
+        return None
+
+
+def crop_face_from_obj(frame: np.ndarray, obj_meta, padding: float = 0.1) -> Optional[np.ndarray]:
+    """Crop face region from frame with padding. Returns None if invalid."""
+    rect = obj_meta.rect_params
+    h, w = frame.shape[:2]
+    pad_w = int(rect.width * padding)
+    pad_h = int(rect.height * padding)
+    x1 = max(0, int(rect.left) - pad_w)
+    y1 = max(0, int(rect.top) - pad_h)
+    x2 = min(w, int(rect.left + rect.width) + pad_w)
+    y2 = min(h, int(rect.top + rect.height) + pad_h)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame[y1:y2, x1:x2].copy()
+
+
+def save_image(img: np.ndarray, directory: str, prefix: str) -> Optional[str]:
+    """Save image to directory. Returns filepath or None."""
+    os.makedirs(directory, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{prefix}_{ts}.jpg"
+    filepath = os.path.join(directory, filename)
+    ok = cv2.imwrite(filepath, img)
+    if not ok:
+        print(f"[SaveImage] FAILED to write {filepath}")
+        return None
+    return filepath
 
 
 # =============================================================================
@@ -279,9 +334,9 @@ class FaceDatabase:
                 pid_to_name: dict[str, str] = {}
 
                 for u in users:
-                    pid = getattr(u, "person_id", None) or str(uuid.uuid4())
-                    name = getattr(u, "name", pid)
+                    name = getattr(u, "name", "Unknown")
 
+                    # Collect user features
                     user_feats: list[np.ndarray] = []
                     if u.features:
                         for f in u.features:
@@ -298,7 +353,27 @@ class FaceDatabase:
                             except Exception:
                                 pass
 
+                    feats_np = (
+                        np.vstack(user_feats).astype(np.float32)
+                        if user_feats
+                        else np.empty((0, 512), dtype=np.float32)
+                    )
+
+                    # --- Auto-link person_id if missing (from logic_infer.py) ---
+                    if not u.person_id:
+                        pid = self._auto_link_person_id(u, feats_np, session)
+                    else:
+                        pid = u.person_id
+
                     if not user_feats:
+                        continue
+
+                    # Deduplicate by person_id
+                    if pid in pid_to_name:
+                        # Already seen this pid, just append features
+                        for feat in user_feats:
+                            all_feats.append(feat)
+                            owner_idx.append(person_ids.index(pid))
                         continue
 
                     idx = len(names)
@@ -326,54 +401,153 @@ class FaceDatabase:
         except Exception as e:
             print(f"[FaceDB] Error loading from DB: {e}")
 
-    # ---- JSON fallback loader ----
+    def _auto_link_person_id(self, user, feats_np: np.ndarray, session) -> str:
+        """
+        Auto-link person_id for user missing it.
+        1. Search Qdrant with user's features to find existing person_id
+        2. If found, use the best match
+        3. If not found, generate new UUID and seed Qdrant
+        4. Commit to PostgreSQL
+        
+        Mirrors logic from logic_infer.py FaceRecognizer.refresh_users_id_and_features()
+        """
+        pid = None
 
-    def _load_from_json(self, path: str) -> None:
-        """Load pre-registered face features from JSON file"""
-        if not os.path.exists(path):
-            print(f"[FaceDB] Warning: Features file not found: {path}")
-            return
+        # Step 1: Try to find existing person_id from Qdrant
+        if HAS_QDRANT and feats_np.shape[0] > 0:
+            try:
+                candidate_ids = []
+                scores = {}
+                # Sample a few vectors (don't search all if too many)
+                indices = range(0, feats_np.shape[0], max(1, feats_np.shape[0] // 5))
+                for i in indices:
+                    vec = feats_np[i]
+                    n = np.linalg.norm(vec)
+                    if n > 0:
+                        vec = vec / n
+                    hits = qdrant_search(
+                        query_vector=vec.tolist(), limit=10, similarity_threshold=0.35
+                    )
+                    if hits:
+                        for hit in hits:
+                            payload = getattr(hit, "payload", None)
+                            if isinstance(payload, list) and len(payload) > 0:
+                                payload = payload[0]
+                            if not isinstance(payload, dict):
+                                continue
+                            p = payload.get("person_id")
+                            score = float(getattr(hit, "score", 0))
+                            if p:
+                                candidate_ids.append(p)
+                                scores[p] = max(scores.get(p, 0.0), score)
 
-        start = time.time()
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+                candidate_ids = list(set(candidate_ids))
+                if candidate_ids:
+                    # Pick best using DB frequency + score weighting
+                    try:
+                        normalized = [p.strip().lower() for p in candidate_ids if p]
+                        counts = (
+                            session.query(AccessEvent.person_id, func.count(AccessEvent.id))
+                            .filter(func.lower(func.trim(AccessEvent.person_id)).in_(normalized))
+                            .group_by(AccessEvent.person_id)
+                            .all()
+                        )
+                        count_map = {p.lower(): cnt for p, cnt in counts}
+                        best_pid = None
+                        best_weight = -1
+                        for p in normalized:
+                            cnt = count_map.get(p.lower(), 0)
+                            s = scores.get(p, 0.0)
+                            weight = cnt * 2 + s * 10
+                            if weight > best_weight:
+                                best_weight = weight
+                                best_pid = p
+                        pid = best_pid
+                    except Exception:
+                        # Fallback: highest score
+                        pid = max(scores, key=lambda x: scores[x]) if scores else None
+            except Exception as e:
+                print(f"[FaceDB] Qdrant auto-link error: {e}")
 
-        names, person_ids, feats, owner_idx, pid_to_name = [], [], [], [], {}
+        # Step 2: Generate new UUID if no match found
+        if not pid:
+            pid = str(uuid.uuid4())
+            # Seed Qdrant with this user's features
+            if HAS_QDRANT and feats_np.shape[0] > 0:
+                threading.Thread(
+                    target=self._seed_qdrant,
+                    args=(pid, feats_np),
+                    daemon=True,
+                ).start()
 
-        for name, info in data.items():
-            if "feature" not in info:
-                continue
-            feat = info["feature"]
-            if isinstance(feat[0], list):
-                feat = feat[0]
-            vec = np.array(feat, dtype=np.float32)
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
+        # Step 3: Persist to PostgreSQL
+        try:
+            user.person_id = pid
+            session.commit()
+            print(f"[FaceDB] Auto-linked user '{user.name}' -> person_id={pid}")
+        except Exception:
+            session.rollback()
 
-            pid = info.get("person_id", name)
-            idx = len(names)
-            names.append(name)
-            person_ids.append(pid)
-            pid_to_name[pid] = name
-            feats.append(vec)
-            owner_idx.append(idx)
+        return pid
 
-            if "avatar" in info:
-                self.avatars[name] = info["avatar"]
+    @staticmethod
+    def _seed_qdrant(person_id: str, feats_np: np.ndarray) -> None:
+        """Upsert user features to Qdrant (background thread)."""
+        try:
+            features = [f.tolist() for f in feats_np]
+            if features:
+                qdrant_upsert(person_id=person_id, features=features, camera_id="import")
+        except Exception as e:
+            print(f"[FaceDB] Seed Qdrant error: {e}")
 
-        with self._lock:
-            self.names = names
-            self.person_ids = person_ids
-            self.person_id_to_name = pid_to_name
-            if feats:
-                self.features_matrix = np.vstack(feats).astype(np.float32)
-            else:
-                self.features_matrix = np.empty((0, 512), dtype=np.float32)
-            self.features_owner_idx = owner_idx
+    # # ---- JSON fallback loader ----
 
-        print(f"[FaceDB] Loaded {len(self.names)} faces from JSON in "
-              f"{(time.time() - start) * 1000:.1f}ms")
+    # def _load_from_json(self, path: str) -> None:
+    #     """Load pre-registered face features from JSON file"""
+    #     if not os.path.exists(path):
+    #         print(f"[FaceDB] Warning: Features file not found: {path}")
+    #         return
+
+    #     start = time.time()
+    #     with open(path, "r", encoding="utf-8") as f:
+    #         data = json.load(f)
+
+    #     names, person_ids, feats, owner_idx, pid_to_name = [], [], [], [], {}
+
+    #     for name, info in data.items():
+    #         if "feature" not in info:
+    #             continue
+    #         feat = info["feature"]
+    #         if isinstance(feat[0], list):
+    #             feat = feat[0]
+    #         vec = np.array(feat, dtype=np.float32)
+    #         norm = np.linalg.norm(vec)
+    #         if norm > 0:
+    #             vec = vec / norm
+
+    #         pid = info.get("person_id", name)
+    #         idx = len(names)
+    #         names.append(name)
+    #         person_ids.append(pid)
+    #         pid_to_name[pid] = name
+    #         feats.append(vec)
+    #         owner_idx.append(idx)
+
+    #         if "avatar" in info:
+    #             self.avatars[name] = info["avatar"]
+
+    #     with self._lock:
+    #         self.names = names
+    #         self.person_ids = person_ids
+    #         self.person_id_to_name = pid_to_name
+    #         if feats:
+    #             self.features_matrix = np.vstack(feats).astype(np.float32)
+    #         else:
+    #             self.features_matrix = np.empty((0, 512), dtype=np.float32)
+    #         self.features_owner_idx = owner_idx
+
+    #     print(f"[FaceDB] Loaded {len(self.names)} faces from JSON in "
+    #           f"{(time.time() - start) * 1000:.1f}ms")
 
     # ---- Matching ----
 
@@ -674,6 +848,17 @@ class FaceRecognitionProcessor:
         self._refresh_interval_sec = params.get("refresh_interval", 30)
         self._last_refresh = time.time()
 
+        # ---- HTTP Event Sender ----
+        http_cfg = params.get("http_event", {})
+        self._http_sender = HttpEventSender(http_cfg)
+
+        # ---- Image save directories ----
+        os.makedirs(CROP_FACE_DIR, exist_ok=True)
+        os.makedirs(FULL_FRAME_DIR, exist_ok=True)
+
+        # ---- Pending HTTP events (queued by _send_event, consumed by _sgie_probe) ----
+        self._pending_http_events: Dict[tuple, dict] = {}
+
         print(f"[FaceRecognitionProcessor] Initialized: "
               f"{len(self._db.names)} users, "
               f"{self._db.features_matrix.shape[0]} vectors, "
@@ -736,8 +921,9 @@ class FaceRecognitionProcessor:
         return Gst.PadProbeReturn.OK
 
     def _sgie_probe(self, pad, info, user_data) -> Gst.PadProbeReturn:
-        """Process recognition results and update display"""
-        batch = get_batch_meta(info.get_buffer())
+        """Process recognition results, extract frames, crop faces, and send HTTP events"""
+        gst_buffer = info.get_buffer()
+        batch = get_batch_meta(gst_buffer)
         if not batch:
             return Gst.PadProbeReturn.OK
 
@@ -750,9 +936,38 @@ class FaceRecognitionProcessor:
         # Periodic flush new persons to Qdrant
         self._flush_new_persons()
 
+        frame_cache: Dict[int, np.ndarray] = {}
+
         for frame, obj in BatchIterator(batch):
             name, state, score = self._process_face(frame.source_id, obj, frame.frame_num)
             update_display(obj, name, score, state)
+
+            # Check if _send_event queued an HTTP event for this face
+            key = (frame.source_id, obj.object_id)
+            if key not in self._pending_http_events:
+                continue
+
+            event_info = self._pending_http_events.pop(key)
+
+            # Extract full frame (cached per batch_id to avoid redundant extraction)
+            if frame.batch_id not in frame_cache:
+                extracted = extract_frame(gst_buffer, frame)
+                if extracted is not None:
+                    frame_cache[frame.batch_id] = extracted
+
+            full_frame = frame_cache.get(frame.batch_id)
+            if full_frame is None:
+                print(f"[SgieProbe] Cannot extract frame batch_id={frame.batch_id}")
+                continue
+
+            # Crop face from full frame
+            face_crop = crop_face_from_obj(full_frame, obj)
+            if face_crop is None:
+                print(f"[SgieProbe] Cannot crop face oid={obj.object_id}")
+                continue
+
+            # Save images + send HTTP event (non-blocking)
+            self._save_and_send_http(event_info, full_frame, face_crop)
 
         return Gst.PadProbeReturn.OK
 
@@ -791,8 +1006,8 @@ class FaceRecognitionProcessor:
 
         # ----- Hybrid matching -----
         person_id, name = self._match_face(emb, source_id, oid, trk, frame)
-        # print("====> P_ID", person_id)
-        # print("====> NAME", name)
+        print("====> P_ID", person_id)
+        print("====> NAME", name)
         if person_id:
             return name or person_id, "confirmed", trk.score
         return "", "unknown", 0.0
@@ -1080,7 +1295,7 @@ class FaceRecognitionProcessor:
         self, source_id: int, object_id: int, name: str,
         frame: int, person_id: str = None
     ) -> None:
-        """Send face detection event with cooldown."""
+        """Send face detection event with cooldown. Queues HTTP event for _sgie_probe."""
         # Cooldown check
         key = (source_id, object_id)
         now = time.time()
@@ -1095,6 +1310,15 @@ class FaceRecognitionProcessor:
             return
 
         camera_id = self._source_mapper.get_camera_id(source_id) if self._source_mapper else None
+
+        # Queue HTTP event — will be processed in _sgie_probe where gst_buffer is available
+        self._pending_http_events[key] = {
+            "person_id": person_id or name,
+            "name": name,
+            "camera_id": camera_id or str(source_id),
+            "source_id": source_id,
+        }
+
         event = {
             "type": "face_detected",
             "camera_id": camera_id,
@@ -1106,6 +1330,44 @@ class FaceRecognitionProcessor:
             "avatar": self._db.avatars.get(name),
         }
         self._sink.send_event(event)
+
+    # =========================================================================
+    # HTTP Event: Save Images + Send
+    # =========================================================================
+
+    def _save_and_send_http(self, event_info: dict, full_frame: np.ndarray, face_crop: np.ndarray):
+        """Save crop + full frame images to disk, then queue HTTP event send."""
+        person_id = event_info["person_id"]
+        camera_id = event_info.get("camera_id", "0")
+        prefix = f"{camera_id}_{person_id}"
+
+        # Save crop face
+        crop_path = save_image(face_crop, CROP_FACE_DIR, prefix)
+        if crop_path:
+            print(f"[HttpEvent] Crop saved: {crop_path}")
+
+        # Save full frame
+        full_path = save_image(full_frame, FULL_FRAME_DIR, prefix)
+        if full_path:
+            print(f"[HttpEvent] Full saved: {full_path}")
+
+        # Use camera_id as stream_id (API expects integer)
+        # camera_id "0" -> stream_id "0", camera_id "cam3" -> try parse or fallback
+        try:
+            stream_id = str(int(camera_id))
+        except ValueError:
+            # Extract digits from camera_id, e.g. "cam3" -> "3"
+            digits = "".join(c for c in camera_id if c.isdigit())
+            stream_id = digits if digits else "0"
+            print(f"[HttpEvent] camera_id={camera_id} -> stream_id={stream_id}")
+
+        # Send via HttpEventSender (non-blocking queue)
+        self._http_sender.send(
+            person_id=person_id,
+            full_frame=full_frame,
+            face_crop=face_crop,
+            stream_id=stream_id,
+        )
 
     # =========================================================================
     # Cleanup
@@ -1138,15 +1400,17 @@ class FaceRecognitionProcessor:
         print(f"[FaceRecognitionProcessor] Pipeline built, branch: {branch_info.name}")
 
     def on_start(self) -> None:
-        """Start cleanup timer when pipeline starts"""
+        """Start cleanup timer and HTTP sender when pipeline starts"""
         if self._cleanup_runner:
             self._cleanup_runner.start()
+        self._http_sender.start()
         print("[FaceRecognitionProcessor] Started")
 
     def on_stop(self) -> None:
-        """Stop cleanup timer when pipeline stops"""
+        """Stop cleanup timer and HTTP sender when pipeline stops"""
         if self._cleanup_runner:
             self._cleanup_runner.stop()
+        self._http_sender.stop()
         # Flush remaining new persons
         self._flush_new_persons()
         print("[FaceRecognitionProcessor] Stopped")

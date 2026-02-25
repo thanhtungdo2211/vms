@@ -1,7 +1,29 @@
 params:
-  features_json: "${FEATURES_JSON:data/face/features.json}"
   l2_threshold: 1.0
   min_streak: 3
+
+  # ---- Recognition thresholds ----
+  pg_sim_high: 0.65          # was 0.58 — instant match chặt hơn
+  pg_sim_low: 0.52           # was 0.45 — voting chặt hơn
+  pg_sim_floor: 0.45         # was 0.40 — fallback Qdrant chặt hơn
+  qdrant_threshold: 0.50     # was 0.40 — Qdrant match chặt hơn
+  qdrant_low_threshold: 0.45 # was 0.40 — recheck chặt hơn
+  vote_threshold: 3          # was 2   — cần 3 votes thay vì 2
+  stable_frames: 15
+  min_unknown_frames_before_create: 30  # was 20 — chờ lâu hơn
+  recheck_cooldown_sec: 3.0
+  qdrant_cooldown_sec: 5.0
+
+  # ---- Alert cooldown ----
+  alert_cooldown_sec: 20
+
+  # ---- HTTP Event Sending ----
+  http_event:
+    base_url: "http://192.168.6.39:5555"
+    endpoint: "/api/v1/event/access-events"
+    token: ""
+    stream_id: 1
+    timeout: 60.0
 
 # sink:
 #   enable: true
@@ -11,7 +33,7 @@ params:
 
 sink:
   enable: true
-  type: filesink   # Các loại: filesink, fakesink, rtsp, display
+  type: fakesink   # Các loại: filesink, fakesink, rtsp, display
   properties:
     location: "${OUTPUT_DIR:data/face/output_recognition.avi}"
     sync: false
@@ -46,6 +68,11 @@ muxer:
 
 elements:
   - type: queue
+  - type: nvvideoconvert
+    name: pre_tiler_conv
+  - type: capsfilter
+    name: rgba_caps
+    caps: "video/x-raw(memory:NVMM), format=RGBA"
   - type: nvinfer
     name: pgie
     config_file: "data/face/models/scrfd640/infer.txt"
