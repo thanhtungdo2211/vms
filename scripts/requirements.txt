@@ -5,3 +5,7 @@ fastapi
 uvicorn
 pycuda
 tensorrt==10.3.0
+
+psycopg2-binary
+qdrant-client
+requests

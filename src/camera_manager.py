@@ -296,10 +296,10 @@ class MultibranchCameraManager:
             pad_linked_event = None
 
             # Create source
-            if is_rtsp:
-                self._create_rtsp_source(camera_id, uri, source_id, bin_elem, tee, linked_state)
-            else:
-                _, pad_linked_event = self._create_file_source(camera_id, uri, bin_elem, tee, linked_state)
+            # if is_rtsp:
+            self._create_rtsp_source(camera_id, uri, source_id, bin_elem, tee, linked_state)
+            # else:
+            #     _, pad_linked_event = self._create_file_source(camera_id, uri, bin_elem, tee, linked_state)
 
             self.pipeline.add(bin_elem)
 
