@@ -134,8 +134,7 @@ class MultibranchCameraManager:
             "cudadec-memtype": 0,
             "num-extra-surfaces": 0,
             "latency": 100,
-            "drop-frame-interval": 0,
-            "file-loop": True
+            "drop-frame-interval": 0
         })
         bin_elem.add(source)
 
@@ -298,12 +297,10 @@ class MultibranchCameraManager:
 
             # Create source
             # if is_rtsp:
-            #     self._create_rtsp_source(camera_id, uri, source_id, bin_elem, tee, linked_state)
+            self._create_rtsp_source(camera_id, uri, source_id, bin_elem, tee, linked_state)
             # else:
             #     _, pad_linked_event = self._create_file_source(camera_id, uri, bin_elem, tee, linked_state)
-            
-            self._create_rtsp_source(camera_id, uri, source_id, bin_elem, tee, linked_state)
-            
+
             self.pipeline.add(bin_elem)
 
             # Link branch

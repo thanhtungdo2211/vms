@@ -5,13 +5,15 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
 from src.sinks.base_sink import BaseSink
-from src.common import get_nvvidconv_props, get_encoder_element, detect_platform, link_chain
+from src.common import get_nvvidconv_props, get_encoder_element, detect_platform
 
 
 class FilesinkAdapter(BaseSink):
     """
     Record to AVI/MP4 with H.264 encoding.
-    Pipeline: queue -> nvvideoconvert -> RGBA -> identity -> videoconvert -> encoder -> muxer -> filesink
+    Pipeline: queue -> nvvideoconvert -> capsfilter -> encoder -> h264parse -> muxer -> filesink
+    
+    Auto-detects hardware encoder (nvv4l2h264enc), falls back to x264enc.
     """
 
     _counter = 0
@@ -28,24 +30,43 @@ class FilesinkAdapter(BaseSink):
         platform = detect_platform()
 
         # Get platform-optimized encoder
-        enc_factory, enc_name, enc_props = get_encoder_element(p, self.bitrate)
+        enc_factory, enc_props = get_encoder_element(self.bitrate)
+
+        # nvvideoconvert is always required to convert NVMM→CPU memory
+        # (DeepStream elements output NVMM buffers; software encoders can't read NVMM)
+        # - nvv4l2h264enc (HW): output caps keep memory:NVMM
+        # - x264enc (SW): output caps WITHOUT memory:NVMM → nvvideoconvert
+        #   downloads to CPU RAM, avoiding a second NVMM pool allocation
+        #   (critical on Jetson where CMA is shared and limited)
+        if enc_factory == "nvv4l2h264enc":
+            caps_string = "video/x-raw(memory:NVMM),format=NV12"
+        else:
+            caps_string = "video/x-raw,format=I420"
 
         chain = [
-            self._make("queue", f"{p}_q", {"max-size-buffers": 30, "leaky": 2}),
+            self._make("queue", f"{p}_q", {"max-size-buffers": 4, "leaky": 2}),
             self._make("nvvideoconvert", f"{p}_nv", get_nvvidconv_props()),
-            self._make("capsfilter", f"{p}_caps", {"caps": Gst.Caps.from_string("video/x-raw,format=RGBA")}),
-            self._make("identity", f"{p}_id", {"drop-probability": 0}),
-            self._make("videoconvert", f"{p}_vc"),
-            self._make("queue", f"{p}_q2", {"max-size-buffers": 30, "leaky": 2}),
-            self._make(enc_factory, enc_name, enc_props),
+            self._make("capsfilter", f"{p}_caps", {
+                "caps": Gst.Caps.from_string(caps_string)
+            }),
+            self._make(enc_factory, f"{p}_enc", enc_props),
             self._make("h264parse", f"{p}_parse", {"config-interval": -1}),
-            self._make("avimux" if not self.location.endswith(".mp4") else "mp4mux", f"{p}_mux"),
-            self._make("filesink", f"{p}_sink", {"location": self.location, "sync": False, "async": False}),
+            self._make(
+                "avimux" if not self.location.endswith(".mp4") else "mp4mux",
+                f"{p}_mux"
+            ),
+            self._make("filesink", f"{p}_sink", {
+                "location": self.location,
+                "sync": False,
+                "async": False
+            }),
         ]
 
         for elem in chain:
             pipeline.add(elem)
-        link_chain(chain)
+        for i in range(len(chain) - 1):
+            if not chain[i].link(chain[i + 1]):
+                raise RuntimeError(f"Failed to link {chain[i].get_name()} -> {chain[i+1].get_name()}")
 
         self.elements = chain
         print(f"[FilesinkAdapter] Using encoder: {enc_factory} ({platform.name})")
