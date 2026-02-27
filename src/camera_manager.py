@@ -7,6 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Callable
+from urllib.parse import parse_qs, urlparse
 
 import gi
 gi.require_version("Gst", "1.0")
@@ -14,7 +15,7 @@ from gi.repository import Gst
 
 from src.pipeline_builder import BranchInfo
 from src.source_mapper import SourceIDMapper
-from src.common import make_element
+from src.common import make_element, get_nvvidconv_props
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,152 @@ class MultibranchCameraManager:
         logger.info(f"[CAM] Created uridecodebin for file: {camera_id}")
         return source, pad_linked_event
 
+    def _is_v4l2_uri(self, uri: str) -> bool:
+        """Detect V4L2 URI or direct /dev/video path."""
+        return uri.startswith("v4l2://") or uri.startswith("/dev/video")
+
+    def _normalize_v4l2_device(self, raw: str) -> str:
+        """Normalize v4l2 device notation to /dev/videoN style."""
+        value = (raw or "").strip()
+        if not value:
+            return "/dev/video0"
+        if value.isdigit():
+            return f"/dev/video{value}"
+        if value.startswith("/dev/"):
+            return value
+
+        value = value.lstrip("/")
+        if value.startswith("dev/"):
+            return f"/{value}"
+        if value.startswith("video"):
+            return f"/dev/{value}"
+        return f"/{value}"
+
+    def _parse_v4l2_uri(self, uri: str) -> dict:
+        """
+        Parse V4L2 URI.
+
+        Supported examples:
+        - v4l2:///dev/video0?width=640&height=480&fps=30&format=YUYV
+        - v4l2://dev/video0?format=MJPG
+        - v4l2://0
+        - /dev/video0
+        """
+        defaults = {"width": 640, "height": 480, "fps": 30, "io_mode": 2, "format": "YUYV"}
+
+        if uri.startswith("/dev/video"):
+            device = uri
+            params = {}
+        else:
+            parsed = urlparse(uri)
+            if parsed.scheme != "v4l2":
+                raise ValueError(f"Unsupported V4L2 URI: {uri}")
+            params = parse_qs(parsed.query)
+
+            raw_device = params.get("device", [None])[0]
+            if not raw_device:
+                if parsed.netloc and parsed.path:
+                    raw_device = f"{parsed.netloc}{parsed.path}"
+                elif parsed.path and parsed.path != "/":
+                    raw_device = parsed.path
+                else:
+                    raw_device = parsed.netloc
+
+            device = self._normalize_v4l2_device(raw_device or "/dev/video0")
+
+        if not device.startswith("/dev/video"):
+            raise ValueError(
+                f"Invalid V4L2 device '{device}'. Use /dev/videoN (example: /dev/video0)."
+            )
+
+        def get_int(key: str, default: int) -> int:
+            val = params.get(key, [str(default)])[0]
+            try:
+                parsed_val = int(val)
+            except ValueError as e:
+                raise ValueError(f"Invalid V4L2 parameter {key}={val}") from e
+            if parsed_val <= 0:
+                raise ValueError(f"V4L2 parameter {key} must be > 0")
+            return parsed_val
+
+        width = get_int("width", defaults["width"])
+        height = get_int("height", defaults["height"])
+        framerate = get_int("framerate", defaults["fps"])
+        fps = get_int("fps", framerate)
+        io_mode_dash = get_int("io-mode", defaults["io_mode"])
+        io_mode = get_int("io_mode", io_mode_dash)
+        fmt = params.get("format", params.get("pixfmt", [defaults["format"]]))[0].upper()
+
+        if fmt in {"YUYV", "YUY2"}:
+            input_caps = f"video/x-raw,format=YUY2,width={width},height={height},framerate={fps}/1"
+            is_mjpeg = False
+        elif fmt in {"MJPG", "MJPEG", "JPEG"}:
+            input_caps = f"image/jpeg,width={width},height={height},framerate={fps}/1"
+            is_mjpeg = True
+        else:
+            raise ValueError(
+                f"Unsupported V4L2 format '{fmt}'. Supported: YUYV, MJPG"
+            )
+
+        return {
+            "device": device,
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "io_mode": io_mode,
+            "format": fmt,
+            "input_caps": input_caps,
+            "is_mjpeg": is_mjpeg,
+        }
+
+    def _create_v4l2_source(self, camera_id: str, uri: str, bin_elem: Gst.Bin,
+                            tee: Gst.Element, linked_state: dict) -> None:
+        """Create USB camera source using v4l2src -> convert -> NVMM NV12."""
+        cfg = self._parse_v4l2_uri(uri)
+
+        source = make_element("v4l2src", f"v4l2src_{camera_id}", {
+            "device": cfg["device"],
+            "do-timestamp": True,
+            "io-mode": cfg["io_mode"],
+        })
+        in_caps = make_element("capsfilter", f"v4l2caps_{camera_id}", {
+            "caps": Gst.Caps.from_string(cfg["input_caps"])
+        })
+        nvconv = make_element("nvvideoconvert", f"v4l2nvconv_{camera_id}", get_nvvidconv_props())
+        out_caps = make_element("capsfilter", f"v4l2outcaps_{camera_id}", {
+            "caps": Gst.Caps.from_string("video/x-raw(memory:NVMM),format=NV12")
+        })
+
+        elements = [source, in_caps]
+        if cfg["is_mjpeg"]:
+            jpegdec = make_element("jpegdec", f"jpegdec_{camera_id}")
+            elements.append(jpegdec)
+        else:
+            swconv = make_element("videoconvert", f"videoconvert_{camera_id}")
+            elements.append(swconv)
+        elements.extend([nvconv, out_caps])
+
+        for elem in elements:
+            bin_elem.add(elem)
+
+        for src, dst in zip(elements, elements[1:]):
+            if not src.link(dst):
+                raise RuntimeError(f"Failed to link {src.get_name()} -> {dst.get_name()} for {camera_id}")
+
+        src_pad = elements[-1].get_static_pad("src")
+        sink_pad = tee.get_static_pad("sink")
+        if not src_pad or not sink_pad:
+            raise RuntimeError(f"Cannot get source/tee pad for V4L2 camera {camera_id}")
+
+        ret = src_pad.link(sink_pad)
+        if ret != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"Failed to link V4L2 source to tee for {camera_id}: {ret}")
+
+        linked_state["done"] = True
+        logger.info(
+            f"[CAM] Created V4L2 source: {camera_id} ({cfg['device']} {cfg['width']}x{cfg['height']}@{cfg['fps']} {cfg['format']})"
+        )
+
     # ─────────────────────────────────────────────────────────────────────────
     # Branch Linking
     # ─────────────────────────────────────────────────────────────────────────
@@ -280,7 +427,8 @@ class MultibranchCameraManager:
     def _create_new_camera(self, camera_id: str, uri: str, branch_name: str) -> bool:
         """Create and add new camera to pipeline."""
         _, prev_state, _ = self.pipeline.get_state(0)
-        is_rtsp = uri.startswith("rtsp://") or uri.startswith("rtsps://")
+        is_rtsp = uri.startswith("rtsp://") or uri.startswith("rtsps://") 
+        is_v4l2 = self._is_v4l2_uri(uri)
         is_file = uri.startswith("file://")
 
         logger.info(f"[CAM] Adding {camera_id} - state: {prev_state.value_nick}")
@@ -296,11 +444,11 @@ class MultibranchCameraManager:
             pad_linked_event = None
 
             # Create source
-            # if is_rtsp:
-            self._create_rtsp_source(camera_id, uri, source_id, bin_elem, tee, linked_state)
-            # else:
-            #     _, pad_linked_event = self._create_file_source(camera_id, uri, bin_elem, tee, linked_state)
-
+            if is_rtsp or is_file:
+                self._create_rtsp_source(camera_id, uri, source_id, bin_elem, tee, linked_state)
+            elif is_v4l2:
+                self._create_v4l2_source(camera_id, uri, bin_elem, tee, linked_state)
+     
             self.pipeline.add(bin_elem)
 
             # Link branch
@@ -308,8 +456,8 @@ class MultibranchCameraManager:
             pad = self._link_branch(bin_elem, tee, camera_id, source_id, branch_name, sync=False)
             branch_pads[branch_name] = pad
 
-            # Wait for file source pad linking
-            if is_file and pad_linked_event:
+            # Wait for decodebin dynamic pad linking
+            if pad_linked_event:
                 logger.info("[CAM] Waiting for uridecodebin pad linking...")
                 pad_linked_event.wait(timeout=5.0)
                 time.sleep(0.5)

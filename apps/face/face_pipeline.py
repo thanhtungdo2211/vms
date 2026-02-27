@@ -37,7 +37,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scrfd_engine import SCRFDTRT
-from arcface_engine import IRES
+from apps.face.arcface_onnx import IRES
 
 
 # ─────────────────────────────────────────────────────────
