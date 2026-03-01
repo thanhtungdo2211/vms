@@ -1,5 +1,9 @@
 params:
-  features_json: "${FEATURES_JSON:data/face/features.json}"
+  # Qdrant vector database connection
+  qdrant_host: "${QDRANT_HOST:localhost}"
+  qdrant_port: "${QDRANT_PORT:6333}"
+  qdrant_collection: "${QDRANT_COLLECTION:faces}"
+  # Matching thresholds
   l2_threshold: 1.0
   min_streak: 3
 

@@ -9,13 +9,14 @@ This module contains face recognition components with minimal class usage:
 Auto-registered with ProcessorRegistry using @register decorator.
 """
 
-import json
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Any, Callable, Optional
 
 import numpy as np
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
@@ -97,64 +98,138 @@ def update_display(obj_meta, name: str, score: float, state: str = "confirmed") 
 
 
 # =============================================================================
-# Face Database
+# Face Database (Qdrant)
 # =============================================================================
 
-class FaceDatabase:
+class QdrantFaceDatabase:
     """
-    Manages registered face features for matching.
-    
-    Loads face embeddings from JSON and provides L2-distance matching.
+    Face feature storage and matching backed by Qdrant vector database.
+
+    Replaces JSON-based FaceDatabase. Connects to a running Qdrant instance
+    and uses nearest-neighbour search (EUCLID / L2) for face matching.
+
+    Collection schema (created by migrate_json_to_qdrant.py):
+        name: "faces", dim: 512, distance: EUCLID
+        payload: {name, avatar, source, type, image_id}
+
+    One user can have multiple vectors (multiple images).
+    Point IDs are deterministic uuid5(name_imageN_type) so re-running is idempotent.
     """
 
-    def __init__(self, features_path: str):
-        self.names: list[str] = []
-        self.features_matrix: np.ndarray | None = None
+    def __init__(self, host: str = "localhost", port: int = 6333,
+                 collection: str = "faces"):
+        self._collection = collection
+        self._client = QdrantClient(host=host, port=port)
         self.avatars: dict[str, str] = {}
-        self._load(features_path)
+        self._total = 0
+        self._init_collection()
+        self._load_avatars()
 
-    def _load(self, path: str) -> None:
-        """Load pre-registered face features from JSON"""
-        if not os.path.exists(path):
-            print(f"Warning: Features file not found: {path}")
+    def _init_collection(self) -> None:
+        """Ensure collection exists; create empty one if missing."""
+        existing = {c.name for c in self._client.get_collections().collections}
+        if self._collection not in existing:
+            self._client.create_collection(
+                collection_name=self._collection,
+                vectors_config=VectorParams(size=512, distance=Distance.EUCLID),
+            )
+            print(f"[QdrantFaceDB] Created empty collection '{self._collection}'")
+        self._total = self._client.count(self._collection).count
+        print(f"[QdrantFaceDB] Connected — collection '{self._collection}' "
+              f"has {self._total} point(s)")
+
+    def _load_avatars(self) -> None:
+        """Cache avatar payloads for use in events (name → avatar string)."""
+        if self._total == 0:
             return
+        offset = None
+        while True:
+            result, next_offset = self._client.scroll(
+                collection_name=self._collection,
+                limit=200,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in result:
+                p = point.payload or {}
+                name = p.get("name")
+                avatar = p.get("avatar")
+                if name and avatar and name not in self.avatars:
+                    self.avatars[name] = avatar
+            if next_offset is None:
+                break
+            offset = next_offset
 
-        start = time.time()
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    def match(self, embedding: np.ndarray) -> tuple[str | None, float]:
+        """
+        Nearest-neighbour search in Qdrant (real-time, no restart needed).
+        Returns (person_name, l2_distance). Returns (None, inf) if DB is empty.
 
-        features = []
-        for name, info in data.items():
-            if "feature" not in info:
-                continue
+        New users added to Qdrant are automatically found without restarting.
+        """
+        if self._total == 0:
+            # Refresh count in case new users were added
+            self._total = self._client.count(self._collection).count
+            if self._total == 0:
+                return None, float("inf")
 
-            feat = info["feature"]
-            if isinstance(feat[0], list):
-                feat = feat[0]
-            vec = np.array(feat, dtype=np.float32)
+        try:
+            result = self._client.query_points(
+                collection_name=self._collection,
+                query=embedding.tolist(),
+                limit=1,
+                with_payload=True,
+            )
+            hits = result.points
+        except Exception as e:
+            print(f"[QdrantFaceDB] query_points error: {e}")
+            return None, float("inf")
 
+        if not hits:
+            return None, float("inf")
+
+        hit = hits[0]
+        name = (hit.payload or {}).get("name")
+        # Qdrant EUCLID score IS the L2 distance
+        return name, float(hit.score)
+
+    def refresh_count(self) -> None:
+        """Refresh cached total count (called periodically if needed)."""
+        self._total = self._client.count(self._collection).count
+
+    def add_embeddings(self, name: str, embeddings: list[np.ndarray],
+                       source: str = "auto") -> None:
+        """Upsert new embeddings for a person (used by AutoSaveWorker).
+        
+        Each embedding gets a unique time-based ID, supporting multiple
+        vectors per user from different images.
+        """
+        import uuid
+        _NS = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        points = []
+        for i, emb in enumerate(embeddings):
+            vec = emb.flatten()
             norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
+            vec = (vec / norm).tolist() if norm > 0 else vec.tolist()
+            pid = str(uuid.uuid5(_NS, f"{name}_auto_{i}_{time.time_ns()}"))
+            points.append(PointStruct(
+                id=pid,
+                vector=vec,
+                payload={"name": name, "source": source, "type": "auto", "image_id": i},
+            ))
+        if points:
+            self._client.upsert(collection_name=self._collection, points=points)
+            self._total = self._client.count(self._collection).count
+            print(f"[QdrantFaceDB] Auto-saved {len(points)} embedding(s) for '{name}'. "
+                  f"Total: {self._total}")
 
-            self.names.append(name)
-            features.append(vec)
-            if "avatar" in info:
-                self.avatars[name] = info["avatar"]
+    def count(self) -> int:
+        """Return total number of points in the collection."""
+        return self._total
 
-        if features:
-            self.features_matrix = np.vstack(features).astype(np.float32)
-
-        print(f"Loaded {len(self.names)} registered faces in {(time.time() - start) * 1000:.1f}ms")
-
-    def match(self, embedding: np.ndarray) -> tuple[int, float]:
-        """Match embedding against database. Returns (person_idx, distance)"""
-        if self.features_matrix is None:
-            return -1, float("inf")
-
-        distances = np.linalg.norm(self.features_matrix - embedding, axis=1)
-        idx = int(np.argmin(distances))
-        return idx, float(distances[idx])
+# Keep alias for backward compatibility
+FaceDatabase = QdrantFaceDatabase
 
 
 # =============================================================================
@@ -176,7 +251,7 @@ class TrackedFace:
     label: str | None = None
     score: float = 0.0
 
-    _person: int = -1
+    _person: str | None = None  # person name (was int index, now string from Qdrant)
     _streak: int = 0
     _distances: list[float] = field(default_factory=list)
 
@@ -188,9 +263,9 @@ class TrackedFace:
         interval = self.reid_interval if self.label else self.skip_reid
         return (frame - self.last_sgie) >= interval
 
-    def add_match(self, person: int, distance: float) -> bool:
+    def add_match(self, person: str | None, distance: float) -> bool:
         """Add match result. Returns True if identity confirmed."""
-        if distance > self.l2_threshold:
+        if person is None or distance > self.l2_threshold:
             return False
         if person != self._person:
             self._person = person
@@ -206,7 +281,7 @@ class TrackedFace:
         is_new = self.label is None
         self.label = name
         self.score = sum(self._distances) / len(self._distances) if self._distances else 0.0
-        self._person, self._streak, self._distances = -1, 0, []
+        self._person, self._streak, self._distances = None, 0, []
         if is_new:
             print(f"[CONFIRMED] id={self.object_id} -> {name} (score={self.score:.3f})")
         return is_new
@@ -339,11 +414,16 @@ class FaceRecognitionProcessor:
         self._source_mapper = source_mapper
         params = config.get("params", {})
 
-        # Load face database
-        features_path = params.get("features_json", "data/face/features.json")
-        print(f"[FaceRecognitionProcessor] Loading {features_path}...")
-        self._db = FaceDatabase(features_path)
-        print(f"[FaceRecognitionProcessor] Loaded {len(self._db.names)} faces")
+        # Connect to Qdrant face database
+        qdrant_host = params.get("qdrant_host", os.getenv("QDRANT_HOST", "localhost"))
+        qdrant_port = int(params.get("qdrant_port", os.getenv("QDRANT_PORT", 6333)))
+        qdrant_collection = params.get("qdrant_collection", "faces")
+        print(f"[FaceRecognitionProcessor] Connecting to Qdrant "
+              f"{qdrant_host}:{qdrant_port} collection='{qdrant_collection}'...")
+        self._db = QdrantFaceDatabase(
+            host=qdrant_host, port=qdrant_port, collection=qdrant_collection
+        )
+        print(f"[FaceRecognitionProcessor] Loaded {self._db.count()} face point(s)")
 
         # Initialize tracker manager and event set
         self._trackers = TrackerManager(params)
@@ -430,9 +510,8 @@ class FaceRecognitionProcessor:
         emb = extract_embedding(obj_meta)
         if emb is not None:
             trk.last_sgie = frame
-            person, dist = self._db.match(emb)
-            if trk.add_match(person, dist):
-                name = self._db.names[person]
+            name, dist = self._db.match(emb)  # Qdrant returns (name, l2_distance)
+            if trk.add_match(name, dist):
                 if trk.confirm(name):
                     self._send_event(source_id, oid, name, frame)
 
@@ -481,12 +560,12 @@ class FaceRecognitionProcessor:
             return None
         total, confirmed, pending = self._trackers.stats()
         return {
-            "faces_in_database": len(self._db.names) if self._db else 0,
+            "faces_in_database": self._db.count() if self._db else 0,
             "trackers_total": total,
             "trackers_confirmed": confirmed,
             "trackers_pending": pending,
         }
 
     @property
-    def database(self) -> Optional[FaceDatabase]:
+    def database(self) -> Optional[QdrantFaceDatabase]:
         return self._db
