@@ -6,11 +6,18 @@ params:
   # Matching thresholds
   l2_threshold: 1.0
   min_streak: 3
+  reid_interval: 20              # ← THÊM: giảm từ default 30 xuống 15 frames
+  skip_reid: 3
+
+  # Tracker lifetime — phải đủ lâu để auto-save worker kịp chạy
+  tracker_max_age: 300          # 300 frames @ 25fps = 12s
+  tracker_cleanup_interval: 150 # cleanup mỗi 6s
+  cleanup_interval: 10
   # Auto-save: capture diverse embeddings of confirmed faces → improve hard-case recall
   # (masked/covered faces will be recognized on next appearance)
   auto_save_enabled: true
-  auto_save_l2_threshold: 0.5    # Only buffer embeddings with L2 dist < this (high confidence)
-  auto_save_interval: 30         # Seconds between flushes to Qdrant
+  auto_save_l2_threshold: 0.9   # Only buffer embeddings with L2 dist < this (high confidence)
+  auto_save_interval: 10         # Seconds between flushes to Qdrant
   auto_save_max_per_run: 3       # Max embeddings saved per tracker per flush
   auto_save_max_total: 20        # Max auto-saved embeddings per person in Qdrant
   auto_save_buffer_size: 10      # Ring-buffer size per tracker

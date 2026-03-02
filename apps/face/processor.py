@@ -18,6 +18,7 @@ from typing import Dict, Any, Callable, Optional
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+import threading
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
@@ -275,12 +276,16 @@ class TrackedFace:
     last_sgie: int = 0
     age: int = 0
 
-    # Auto-save: ring buffer of (embedding, l2_dist) for confirmed identity
+    # Auto-save: ring buffer of (embedding, l2_dist)
+    # Lưu cả PRE-confirm (hard cases) và POST-confirm frames
     embedding_buffer: deque = field(default_factory=deque)
+    # Pre-confirm buffer: lưu embeddings trong quá trình streak
+    # Khi confirm → merge vào embedding_buffer chính
+    _pre_confirm_buffer: deque = field(default_factory=deque)
 
     def __post_init__(self):
-        # Re-create deque with correct maxlen after dataclass init
         self.embedding_buffer = deque(maxlen=self.auto_save_buffer_size)
+        self._pre_confirm_buffer = deque(maxlen=self.auto_save_buffer_size)
 
     def should_run_sgie(self, frame: int) -> bool:
         """Check if SGIE should run based on frame interval"""
@@ -290,27 +295,39 @@ class TrackedFace:
     def add_match(self, person: str | None, distance: float) -> bool:
         """Add match result. Returns True if identity confirmed."""
         if person is None or distance > self.l2_threshold:
+            # Miss → clear pre-confirm buffer cho person này
+            if person != self._person:
+                self._pre_confirm_buffer.clear()
             return False
         if person != self._person:
             self._person = person
             self._distances = [distance]
             self._streak = 1
+            self._pre_confirm_buffer.clear()
             return False
         self._streak += 1
         self._distances.append(distance)
         return self._streak >= self.min_streak
 
+    def buffer_pre_confirm(self, emb: np.ndarray, dist: float) -> None:
+        """Buffer embedding trong quá trình streak (pre-confirm hard cases)."""
+        self._pre_confirm_buffer.append((emb.copy(), dist))
+
     def confirm(self, name: str) -> bool:
         """Confirm identity. Returns True if first confirmation."""
         is_new = self.label is None
         if self.label is not None and self.label != name:
-            # Identity changed — discard buffer from previous person
             self.embedding_buffer.clear()
         self.label = name
         self.score = sum(self._distances) / len(self._distances) if self._distances else 0.0
+        # Merge pre-confirm embeddings → main buffer (đây là các hard cases!)
+        for item in self._pre_confirm_buffer:
+            self.embedding_buffer.append(item)
+        self._pre_confirm_buffer.clear()
         self._person, self._streak, self._distances = None, 0, []
         if is_new:
-            print(f"[CONFIRMED] id={self.object_id} -> {name} (score={self.score:.3f})")
+            print(f"[CONFIRMED] id={self.object_id} -> {name} "
+                  f"(score={self.score:.3f}, buffered={len(self.embedding_buffer)})")
         return is_new
 
     def buffer_embedding(self, emb: np.ndarray, dist: float) -> None:
@@ -323,8 +340,8 @@ class TrackerManager:
 
     def __init__(self, config: dict, max_age: int = 30, cleanup_interval: int = 10):
         self.config = config
-        self.max_age = max_age
-        self.cleanup_interval = cleanup_interval
+        self.max_age = config.get("tracker_max_age", max_age)
+        self.cleanup_interval = config.get("tracker_cleanup_interval", cleanup_interval)
         self._trackers: dict[int, dict[int, TrackedFace]] = {}
         self._last_cleanup = 0
 
@@ -423,12 +440,7 @@ class EventSet:
 class AutoSaveWorker:
     """
     Periodically flush buffered embeddings from confirmed trackers to Qdrant.
-
-    Strategy:
-    - Only saves embeddings below auto_save_l2_threshold (high-quality only)
-    - Sorts candidates by L2 distance (best quality first)
-    - Caps total auto-saved embeddings per person in Qdrant (auto_save_max_total)
-    - Clears the tracker buffer after each successful save
+    Uses threading.Timer (not GLib) to work independently of GLib main loop.
     """
 
     def __init__(self, db: "QdrantFaceDatabase", tracker_manager: TrackerManager,
@@ -438,31 +450,85 @@ class AutoSaveWorker:
         self._l2_threshold = params.get("auto_save_l2_threshold", 0.5)
         self._max_per_run = params.get("auto_save_max_per_run", 3)
         self._max_total = params.get("auto_save_max_total", 20)
+        self._interval = params.get("auto_save_interval", 10)  # seconds
+        self._tick = 0
+        self._timer: threading.Timer | None = None
+        self._running = False
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        """Start the periodic auto-save timer."""
+        self._running = True
+        self._schedule_next()
+        print(f"[AutoSaveWorker] Started (interval={self._interval}s)")
+
+    def stop(self) -> None:
+        """Stop the periodic auto-save timer."""
+        self._running = False
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+        print("[AutoSaveWorker] Stopped")
+
+    def _schedule_next(self) -> None:
+        """Schedule next run."""
+        if not self._running:
+            return
+        with self._lock:
+            self._timer = threading.Timer(self._interval, self._tick_and_reschedule)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _tick_and_reschedule(self) -> None:
+        """Run once then reschedule."""
+        if not self._running:
+            return
+        self._tick += 1
+        try:
+            self.run(self._tick)
+        except Exception as e:
+            print(f"[AutoSaveWorker] Error in run: {e}")
+        self._schedule_next()
 
     def run(self, tick: int) -> None:
-        """Called by IntervalRunner on each timer tick."""
+        """Flush buffered embeddings to Qdrant."""
         saved_total = 0
+        total_confirmed = sum(
+            1 for cam_dict in self._trackers._trackers.values()
+            for trk in cam_dict.values() if trk.label is not None
+        )
+        print(f"[AutoSaveWorker] tick={tick} confirmed_trackers={total_confirmed}")
+
         for cam_dict in self._trackers._trackers.values():
             for trk in cam_dict.values():
                 if trk.label is None or not trk.embedding_buffer:
                     continue
 
-                # Filter to high-quality embeddings only
+                # ← THÊM: chỉ auto-save nếu score đủ tốt (tránh wrong identity)
+                if trk.score > self._l2_threshold:
+                    print(f"[AutoSaveWorker] '{trk.label}' SKIP — score {trk.score:.3f} > threshold {self._l2_threshold}")
+                    continue
+
                 candidates = [
                     (emb, dist) for emb, dist in trk.embedding_buffer
                     if dist <= self._l2_threshold
                 ]
+                print(f"[AutoSaveWorker] '{trk.label}' "
+                      f"buffer={len(trk.embedding_buffer)} "
+                      f"candidates={len(candidates)} "
+                      f"threshold={self._l2_threshold} "
+                      f"dists={[f'{d:.3f}' for _,d in trk.embedding_buffer]}")
+
                 if not candidates:
                     continue
 
-                # Check how many auto-saved embeddings this person already has
                 current_auto = self._db.count_auto_saved(trk.label)
                 slots = self._max_total - current_auto
                 if slots <= 0:
                     trk.embedding_buffer.clear()
                     continue
 
-                # Sort ascending by L2 distance (best = smallest)
                 candidates.sort(key=lambda x: x[1])
                 to_save = candidates[:min(self._max_per_run, slots)]
 
@@ -471,15 +537,12 @@ class AutoSaveWorker:
                 self._db.add_embeddings(trk.label, embeddings, source="auto_save")
                 saved_total += len(embeddings)
                 trk.embedding_buffer.clear()
-                print(
-                    f"[AutoSaveWorker] '{trk.label}' saved {len(embeddings)} embedding(s) "
-                    f"(dist: {[f'{d:.3f}' for d in distances]}) "
-                    f"auto_total: {current_auto + len(embeddings)}/{self._max_total}"
-                )
+                print(f"[AutoSaveWorker] '{trk.label}' saved {len(embeddings)} "
+                      f"(dist: {[f'{d:.3f}' for d in distances]}) "
+                      f"auto_total: {current_auto + len(embeddings)}/{self._max_total}")
 
         if saved_total > 0:
-            print(f"[AutoSaveWorker] tick={tick} — flushed {saved_total} embedding(s) total")
-
+            print(f"[AutoSaveWorker] tick={tick} — flushed {saved_total} total")
 
 # =============================================================================
 # Main Processor (includes probes and event handling)
@@ -526,20 +589,17 @@ class FaceRecognitionProcessor:
         self._trackers = TrackerManager(params)
         self._sent_faces = EventSet(max_age=params.get("max_age", 30))
 
-        # Cleanup runner
+        # Cleanup runner — callback nhận tick (int), không phải frame
         cleanup_interval = params.get("cleanup_interval", 10) * 1000
         self._cleanup_runner = IntervalRunner(cleanup_interval, self._cleanup)
 
-        # Auto-save runner (flush embedding buffers → Qdrant periodically)
-        self._auto_save_runner: IntervalRunner | None = None
+        # Auto-save worker (thread-based timer, không phụ thuộc GLib loop)
+        self._auto_save_worker: AutoSaveWorker | None = None
         if params.get("auto_save_enabled", True):
-            auto_save_interval_ms = params.get("auto_save_interval", 30) * 1000
             self._auto_save_worker = AutoSaveWorker(self._db, self._trackers, params)
-            self._auto_save_runner = IntervalRunner(auto_save_interval_ms,
-                                                    self._auto_save_worker.run)
             print(f"[FaceRecognitionProcessor] Auto-save enabled "
-                  f"(interval={params.get('auto_save_interval', 30)}s, "
-                  f"l2_threshold={params.get('auto_save_l2_threshold', 0.5)}, "
+                  f"(interval={params.get('auto_save_interval', 10)}s, "
+                  f"l2_threshold={params.get('auto_save_l2_threshold', 1.0)}, "
                   f"max_total={params.get('auto_save_max_total', 20)})")
         else:
             print("[FaceRecognitionProcessor] Auto-save disabled")
@@ -607,10 +667,10 @@ class FaceRecognitionProcessor:
 
         return Gst.PadProbeReturn.OK
 
-    def _cleanup(self, current_frame: int) -> None:
+    def _cleanup(self, tick: int) -> None:  # ← sửa: tick thay vì current_frame
         """Cleanup stale trackers and events"""
-        self._trackers.auto_cleanup(current_frame)
-        self._sent_faces.auto_cleanup(current_frame)
+        self._trackers.cleanup()           # ← dùng cleanup() trực tiếp, không cần frame
+        self._sent_faces.cleanup(tick * 1000)
 
     def _process_face(self, source_id: int, obj_meta, frame: int) -> tuple[str, str, float]:
         """Process face and return (name, state, score) for display"""
@@ -621,13 +681,20 @@ class FaceRecognitionProcessor:
         emb = extract_embedding(obj_meta)
         if emb is not None:
             trk.last_sgie = frame
-            name, dist = self._db.match(emb)  # Qdrant returns (name, l2_distance)
-            # Buffer embedding while already confirmed (captures diverse angles/lighting)
-            if trk.label is not None:
-                trk.buffer_embedding(emb, dist)
+            name, dist = self._db.match(emb)
+
+            if trk.label is None:
+                # Chưa confirmed → buffer pre-confirm (hard cases trong streak)
+                if name is not None and dist <= trk.l2_threshold:
+                    trk.buffer_pre_confirm(emb, dist)
+
             if trk.add_match(name, dist):
                 if trk.confirm(name):
+                    # confirm() đã merge pre_confirm_buffer → embedding_buffer
                     self._send_event(source_id, oid, name, frame)
+            elif trk.label is not None:
+                # Đã confirmed → tiếp tục buffer post-confirm frames
+                trk.buffer_embedding(emb, dist)
 
         return (trk.label, "confirmed", trk.score) if trk.label else ("", "unknown", 0.0)
 
@@ -657,17 +724,15 @@ class FaceRecognitionProcessor:
         print(f"[FaceRecognitionProcessor] Pipeline built, branch: {branch_info.name}")
 
     def on_start(self) -> None:
-        """Start cleanup timer when pipeline starts"""
         if self._cleanup_runner:
             self._cleanup_runner.start()
-        if self._auto_save_runner:
-            self._auto_save_runner.start()
+        if self._auto_save_worker:
+            self._auto_save_worker.start()  # ← dùng worker's own timer
         print("[FaceRecognitionProcessor] Started")
 
     def on_stop(self) -> None:
-        """Stop cleanup timer when pipeline stops"""
-        if self._auto_save_runner:
-            self._auto_save_runner.stop()
+        if self._auto_save_worker:
+            self._auto_save_worker.stop()
         if self._cleanup_runner:
             self._cleanup_runner.stop()
         print("[FaceRecognitionProcessor] Stopped")
