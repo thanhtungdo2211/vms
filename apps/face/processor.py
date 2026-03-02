@@ -11,12 +11,13 @@ Auto-registered with ProcessorRegistry using @register decorator.
 
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Any, Callable, Optional
 
 import numpy as np
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
@@ -228,6 +229,21 @@ class QdrantFaceDatabase:
         """Return total number of points in the collection."""
         return self._total
 
+    def count_auto_saved(self, name: str) -> int:
+        """Count auto-saved embeddings for a person (source='auto_save')."""
+        try:
+            result = self._client.count(
+                collection_name=self._collection,
+                count_filter=Filter(must=[
+                    FieldCondition(key="name", match=MatchValue(value=name)),
+                    FieldCondition(key="source", match=MatchValue(value="auto_save")),
+                ])
+            )
+            return result.count
+        except Exception as e:
+            print(f"[QdrantFaceDB] count_auto_saved error: {e}")
+            return 0
+
 # Keep alias for backward compatibility
 FaceDatabase = QdrantFaceDatabase
 
@@ -247,6 +263,7 @@ class TrackedFace:
     min_streak: int = 3
     skip_reid: int = 3
     reid_interval: int = 30
+    auto_save_buffer_size: int = 10
 
     label: str | None = None
     score: float = 0.0
@@ -257,6 +274,13 @@ class TrackedFace:
 
     last_sgie: int = 0
     age: int = 0
+
+    # Auto-save: ring buffer of (embedding, l2_dist) for confirmed identity
+    embedding_buffer: deque = field(default_factory=deque)
+
+    def __post_init__(self):
+        # Re-create deque with correct maxlen after dataclass init
+        self.embedding_buffer = deque(maxlen=self.auto_save_buffer_size)
 
     def should_run_sgie(self, frame: int) -> bool:
         """Check if SGIE should run based on frame interval"""
@@ -279,12 +303,19 @@ class TrackedFace:
     def confirm(self, name: str) -> bool:
         """Confirm identity. Returns True if first confirmation."""
         is_new = self.label is None
+        if self.label is not None and self.label != name:
+            # Identity changed — discard buffer from previous person
+            self.embedding_buffer.clear()
         self.label = name
         self.score = sum(self._distances) / len(self._distances) if self._distances else 0.0
         self._person, self._streak, self._distances = None, 0, []
         if is_new:
             print(f"[CONFIRMED] id={self.object_id} -> {name} (score={self.score:.3f})")
         return is_new
+
+    def buffer_embedding(self, emb: np.ndarray, dist: float) -> None:
+        """Buffer a high-quality embedding for auto-save (only when confirmed)."""
+        self.embedding_buffer.append((emb.copy(), dist))
 
 
 class TrackerManager:
@@ -311,6 +342,7 @@ class TrackerManager:
                 min_streak=self.config.get("min_streak", 3),
                 skip_reid=self.config.get("skip_reid", 3),
                 reid_interval=self.config.get("reid_interval", 30),
+                auto_save_buffer_size=self.config.get("auto_save_buffer_size", 10),
                 last_sgie=frame,
             )
         return cam_dict[oid]
@@ -385,6 +417,71 @@ class EventSet:
 
 
 # =============================================================================
+# Auto-Save Worker (cronjob: flush embedding buffers → Qdrant)
+# =============================================================================
+
+class AutoSaveWorker:
+    """
+    Periodically flush buffered embeddings from confirmed trackers to Qdrant.
+
+    Strategy:
+    - Only saves embeddings below auto_save_l2_threshold (high-quality only)
+    - Sorts candidates by L2 distance (best quality first)
+    - Caps total auto-saved embeddings per person in Qdrant (auto_save_max_total)
+    - Clears the tracker buffer after each successful save
+    """
+
+    def __init__(self, db: "QdrantFaceDatabase", tracker_manager: TrackerManager,
+                 params: dict):
+        self._db = db
+        self._trackers = tracker_manager
+        self._l2_threshold = params.get("auto_save_l2_threshold", 0.5)
+        self._max_per_run = params.get("auto_save_max_per_run", 3)
+        self._max_total = params.get("auto_save_max_total", 20)
+
+    def run(self, tick: int) -> None:
+        """Called by IntervalRunner on each timer tick."""
+        saved_total = 0
+        for cam_dict in self._trackers._trackers.values():
+            for trk in cam_dict.values():
+                if trk.label is None or not trk.embedding_buffer:
+                    continue
+
+                # Filter to high-quality embeddings only
+                candidates = [
+                    (emb, dist) for emb, dist in trk.embedding_buffer
+                    if dist <= self._l2_threshold
+                ]
+                if not candidates:
+                    continue
+
+                # Check how many auto-saved embeddings this person already has
+                current_auto = self._db.count_auto_saved(trk.label)
+                slots = self._max_total - current_auto
+                if slots <= 0:
+                    trk.embedding_buffer.clear()
+                    continue
+
+                # Sort ascending by L2 distance (best = smallest)
+                candidates.sort(key=lambda x: x[1])
+                to_save = candidates[:min(self._max_per_run, slots)]
+
+                embeddings = [emb for emb, _ in to_save]
+                distances = [d for _, d in to_save]
+                self._db.add_embeddings(trk.label, embeddings, source="auto_save")
+                saved_total += len(embeddings)
+                trk.embedding_buffer.clear()
+                print(
+                    f"[AutoSaveWorker] '{trk.label}' saved {len(embeddings)} embedding(s) "
+                    f"(dist: {[f'{d:.3f}' for d in distances]}) "
+                    f"auto_total: {current_auto + len(embeddings)}/{self._max_total}"
+                )
+
+        if saved_total > 0:
+            print(f"[AutoSaveWorker] tick={tick} — flushed {saved_total} embedding(s) total")
+
+
+# =============================================================================
 # Main Processor (includes probes and event handling)
 # =============================================================================
 
@@ -432,6 +529,20 @@ class FaceRecognitionProcessor:
         # Cleanup runner
         cleanup_interval = params.get("cleanup_interval", 10) * 1000
         self._cleanup_runner = IntervalRunner(cleanup_interval, self._cleanup)
+
+        # Auto-save runner (flush embedding buffers → Qdrant periodically)
+        self._auto_save_runner: IntervalRunner | None = None
+        if params.get("auto_save_enabled", True):
+            auto_save_interval_ms = params.get("auto_save_interval", 30) * 1000
+            self._auto_save_worker = AutoSaveWorker(self._db, self._trackers, params)
+            self._auto_save_runner = IntervalRunner(auto_save_interval_ms,
+                                                    self._auto_save_worker.run)
+            print(f"[FaceRecognitionProcessor] Auto-save enabled "
+                  f"(interval={params.get('auto_save_interval', 30)}s, "
+                  f"l2_threshold={params.get('auto_save_l2_threshold', 0.5)}, "
+                  f"max_total={params.get('auto_save_max_total', 20)})")
+        else:
+            print("[FaceRecognitionProcessor] Auto-save disabled")
 
         print("[FaceRecognitionProcessor] Initialized")
 
@@ -511,6 +622,9 @@ class FaceRecognitionProcessor:
         if emb is not None:
             trk.last_sgie = frame
             name, dist = self._db.match(emb)  # Qdrant returns (name, l2_distance)
+            # Buffer embedding while already confirmed (captures diverse angles/lighting)
+            if trk.label is not None:
+                trk.buffer_embedding(emb, dist)
             if trk.add_match(name, dist):
                 if trk.confirm(name):
                     self._send_event(source_id, oid, name, frame)
@@ -546,10 +660,14 @@ class FaceRecognitionProcessor:
         """Start cleanup timer when pipeline starts"""
         if self._cleanup_runner:
             self._cleanup_runner.start()
+        if self._auto_save_runner:
+            self._auto_save_runner.start()
         print("[FaceRecognitionProcessor] Started")
 
     def on_stop(self) -> None:
         """Stop cleanup timer when pipeline stops"""
+        if self._auto_save_runner:
+            self._auto_save_runner.stop()
         if self._cleanup_runner:
             self._cleanup_runner.stop()
         print("[FaceRecognitionProcessor] Stopped")
@@ -559,11 +677,18 @@ class FaceRecognitionProcessor:
         if not self._trackers:
             return None
         total, confirmed, pending = self._trackers.stats()
+        # Count total buffered embeddings across all trackers
+        buffered = sum(
+            len(t.embedding_buffer)
+            for cam_dict in self._trackers._trackers.values()
+            for t in cam_dict.values()
+        )
         return {
             "faces_in_database": self._db.count() if self._db else 0,
             "trackers_total": total,
             "trackers_confirmed": confirmed,
             "trackers_pending": pending,
+            "auto_save_buffered": buffered,
         }
 
     @property

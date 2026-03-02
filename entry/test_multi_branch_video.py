@@ -7,6 +7,8 @@ logging.basicConfig(
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S'
 )
+logging.getLogger("httpx").disabled = True
+logging.getLogger("httpcore").disabled = True
 
 from src.pipeline_builder import PipelineBuilder
 from src.common import load_config

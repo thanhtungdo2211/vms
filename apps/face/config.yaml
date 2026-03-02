@@ -6,6 +6,14 @@ params:
   # Matching thresholds
   l2_threshold: 1.0
   min_streak: 3
+  # Auto-save: capture diverse embeddings of confirmed faces → improve hard-case recall
+  # (masked/covered faces will be recognized on next appearance)
+  auto_save_enabled: true
+  auto_save_l2_threshold: 0.5    # Only buffer embeddings with L2 dist < this (high confidence)
+  auto_save_interval: 30         # Seconds between flushes to Qdrant
+  auto_save_max_per_run: 3       # Max embeddings saved per tracker per flush
+  auto_save_max_total: 20        # Max auto-saved embeddings per person in Qdrant
+  auto_save_buffer_size: 10      # Ring-buffer size per tracker
 
 # sink:
 #   enable: true
