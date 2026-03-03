@@ -4,7 +4,7 @@
 
 set -e
 
-PORT=8083
+PORT="${API_PORT:-8085}"
 
 echo "============================================================"
 echo "  Starting Pipeline with Cleanup"
@@ -15,7 +15,7 @@ echo "[1/3] Killing old Python processes..."
 pkill -9 -f 'python.*test_multi' 2>/dev/null || true
 sleep 1
 
-# Kill processes using port 8083
+# Kill processes using API port
 echo "[2/3] Freeing port $PORT..."
 lsof -ti :$PORT 2>/dev/null | xargs -r kill -9 2>/dev/null || true
 sleep 1
@@ -32,4 +32,4 @@ echo "[3/3] Starting pipeline..."
 echo "============================================================"
 echo ""
 
-exec python3 entry/test_multi_branch_video.py
+exec env GST_DEBUG="${GST_DEBUG:-0}" python3 entry/test_multi_branch_video.py

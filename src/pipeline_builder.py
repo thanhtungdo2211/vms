@@ -16,7 +16,7 @@ from typing import Callable, Optional
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
-
+from gi.repository import GLib
 # Local
 if "/opt/nvidia/deepstream/deepstream/lib" not in sys.path:
     sys.path.append("/opt/nvidia/deepstream/deepstream/lib")
@@ -67,6 +67,8 @@ class PipelineBuilder:
         self.stream_publisher = None
         self.api_server = None
 
+        self._glib_loop: Optional[GLib.MainLoop] = None
+        self._glib_thread: Optional[threading.Thread] = None
 
         if processors:
             # Pre-instantiated processors (for backward compatibility)
@@ -78,6 +80,38 @@ class PipelineBuilder:
             self.processor_classes = ProcessorRegistry.get_classes_for_config(config)
 
         self.branch_sinks = branch_sinks if branch_sinks else self._create_sinks()
+    
+    def _start_glib_mainloop(self):
+        """Start GLib MainLoop in background thread for GStreamer event processing.
+        
+        Required for:
+        - nvurisrcbin RTSP reconnection
+        - Bus message handling
+        - Timer callbacks
+        """
+        if self._glib_loop is not None:
+            return  # Already running
+        
+        self._glib_loop = GLib.MainLoop()
+        self._glib_thread = threading.Thread(
+            target=self._glib_loop.run,
+            name="GLibMainLoop",
+            daemon=True
+        )
+        self._glib_thread.start()
+        logger.info("GLib MainLoop started in background thread")
+
+    def _stop_glib_mainloop(self):
+        """Stop GLib MainLoop gracefully."""
+        if self._glib_loop is not None:
+            self._glib_loop.quit()
+            self._glib_loop = None
+        
+        if self._glib_thread is not None:
+            self._glib_thread.join(timeout=2.0)
+            self._glib_thread = None
+        
+        logger.info("GLib MainLoop stopped")
 
     def _create_sinks(self) -> dict[str, BaseSink]:
         """Create sinks based on config."""
@@ -115,11 +149,9 @@ class PipelineBuilder:
         - Starting sinks
         - Creating camera manager with SourceIDMapper
         - Instantiating processors with SourceIDMapper
-        - Creating stream publisher
         - Warmup and starting API server
         """
         from src.camera_manager import MultibranchCameraManager
-        from src.stream_publisher import StreamPublisher
         from src.api.camera_api import CameraAPIServer
 
         Gst.init(None)
@@ -138,6 +170,7 @@ class PipelineBuilder:
         # Create camera manager (provides SourceIDMapper) - BEFORE building branches
         # so we have source_mapper available for processor instantiation
         self.camera_manager = MultibranchCameraManager(self.pipeline, {})
+        self.camera_manager.set_pipeline_builder(self)  # For proper shutdown on restart
         source_mapper = self.camera_manager.get_mapper()
 
         # Instantiate processors BEFORE building branches (so probes are registered first)
@@ -164,6 +197,18 @@ class PipelineBuilder:
         self.camera_manager.branches = self.branches
 
         self.pipeline.get_bus().add_signal_watch()
+        def process_messages():
+            # Process pending GLib events
+            context = GLib.MainContext.default()
+            while context.pending():
+                context.iteration(False)
+            return True  # Continue calling
+        
+        # Process events mỗi 100ms
+        GLib.timeout_add(100, process_messages)
+        
+        # Start GLib MainLoop
+        self._start_glib_mainloop()        
         logger.info(f"Pipeline built: {len(self.branches)} branches")
 
         # Notify processors that pipeline is built
@@ -171,11 +216,7 @@ class PipelineBuilder:
             if name in self.branches:
                 proc.on_pipeline_built(self.pipeline, self.branches[name])
 
-        # Create SRT publisher (MUST be before READY state - needs NULL state pads)
-        self.stream_publisher = StreamPublisher(
-            self.pipeline, self.branches, self.camera_manager
-        )
-        logger.info("Stream publisher created (per-camera annotated streams)")
+        # Streaming removed - no StreamPublisher initialization
 
         # Start processors
         self.start_processors()
@@ -183,8 +224,7 @@ class PipelineBuilder:
         # Start API server
         self.api_server = CameraAPIServer(
             self.config.get("camera_api", {}),
-            self.camera_manager,
-            stream_publisher=self.stream_publisher
+            self.camera_manager
         )
         self.api_server.start()
 
@@ -207,28 +247,20 @@ class PipelineBuilder:
 
         # Create element chain
         chain = [mux]
-        demux_elem = None
         for elem_cfg in cfg.get("elements", []):
             elem = self._create_element(elem_cfg, name)
             chain.append(elem)
             for pad, probe in elem_cfg.get("probes", {}).items():
                 self.probe_registry.attach(elem, pad, probe)
-            # Track demux element (doesn't link to next in chain normally)
-            if elem_cfg["type"] == "nvstreamdemux":
-                demux_elem = elem
 
         # Create sink
         sink = self.branch_sinks[name].create(self.pipeline)
 
-        # Link chain - special handling for demux
-        if demux_elem:
-            link_chain(chain, stop_at=demux_elem)
-            logger.info(f"[{name}] Branch with nvstreamdemux - per-camera RTSP via demux pads")
-        else:
-            chain.append(sink)
-            link_chain(chain)
+        # Link chain normally (streaming removed - no demux special handling)
+        chain.append(sink)
+        link_chain(chain)
 
-        self.branches[name] = BranchInfo(name, mux, chain[1:-1] if not demux_elem else chain[1:], sink, cfg.get("max_cameras", 8))
+        self.branches[name] = BranchInfo(name, mux, chain[1:-1], sink, cfg.get("max_cameras", 8))
 
     def _create_element(self, cfg: dict, prefix: str) -> Gst.Element:
         """Create GStreamer element from config.
@@ -352,4 +384,3 @@ class PipelineBuilder:
         while not stop_event.is_set():
             threading.Event().wait(1)
         self.shutdown()
-

@@ -1006,8 +1006,8 @@ class FaceRecognitionProcessor:
 
         # ----- Hybrid matching -----
         person_id, name = self._match_face(emb, source_id, oid, trk, frame)
-        print("====> P_ID", person_id)
-        print("====> NAME", name)
+        # print("====> P_ID", person_id)
+        # print("====> NAME", name)
         if person_id:
             return name or person_id, "confirmed", trk.score
         return "", "unknown", 0.0
