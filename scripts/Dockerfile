@@ -1,7 +1,7 @@
 # ==========================================
-# VMSx - DeepStream 7.1 VMS Core
+# VMSx - DeepStream 8.0 VMS Core (WSL2 + RTX 5070)
 # ==========================================
-FROM nvcr.io/nvidia/deepstream:7.1-triton-multiarch
+FROM nvcr.io/nvidia/deepstream:8.0-triton-multiarch
 
 # ----------------
 # Environment
@@ -20,25 +20,28 @@ WORKDIR /app
 # Step 1: Install gstreamer1.0-libav
 RUN apt-get update && apt-get install -y gstreamer1.0-libav
 
-# Step 2: Reinstall gstreamer plugins and ffmpeg libs
-RUN apt-get install --reinstall -y gstreamer1.0-plugins-good \
-                            gstreamer1.0-plugins-bad \
-                            gstreamer1.0-plugins-ugly \
-                            libswresample-dev \
-                            libavutil-dev \
-                            libavutil56 \
-                            libavcodec-dev \
-                            libavcodec58 \
-                            libavformat-dev \
-                            libavformat58 \
-                            libavfilter7 \
-                            libde265-dev \
-                            libde265-0 \
-                            libx265-199 \
-                            libx264-163 \
-                            libvpx7 \
-                            libmpeg2encpp-2.1-0 \
-                            libmpeg2-4 libmpg123-0
+# Step 2: Install core libraries and gstreamer plugins (Ubuntu 24.04 / DS 8.0)
+RUN apt-get install --reinstall -y \
+    libssl3 \
+    libssl-dev \
+    libgles2-mesa-dev \
+    libgstreamer1.0-0 \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    libgstreamer-plugins-base1.0-dev \
+    libgstrtspserver-1.0-0 \
+    libjansson4 \
+    libyaml-cpp-dev \
+    libjsoncpp-dev \
+    protobuf-compiler \
+    libmosquitto1 \
+    gcc \
+    make \
+    git \
+    python3
 
 # Step 3: Install gstreamer and python dependencies
 RUN apt-get install -y \
@@ -53,18 +56,18 @@ RUN apt-get install -y \
     python3-dev \
     libgirepository1.0-dev
 
-# Step 4: Install opencv (deepstream 7.0)
+# Step 4: Install opencv
 RUN apt-get install -y libopencv-dev \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf ~/.cache/gstreamer-1.0/
 
-# Install Python packages
-RUN pip3 install --no-cache-dir \
+# Install Python packages (Python 3.12 in DS 8.0 / Ubuntu 24.04 requires --break-system-packages)
+RUN pip3 install --no-cache-dir --break-system-packages \
     websockets \
     numpy \
     PyGObject \
-    https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.0/pyds-1.2.0-cp310-cp310-linux_x86_64.whl
+    https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.2/pyds-1.2.2-cp312-cp312-linux_x86_64.whl
 
 # Install additional requirements
 COPY scripts/requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt && rm /tmp/requirements.txt

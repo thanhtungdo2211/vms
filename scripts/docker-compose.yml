@@ -1,4 +1,4 @@
-# Docker Compose v2 configuration for VMSx VMS Core
+# Docker Compose v2 configuration for VMSx VMS Core (WSL2 + RTX 5070)
 services:
   vmsx:
     build:
@@ -9,10 +9,10 @@ services:
     env_file:
       - .env
 
-    # Privileged mode required for nvv4l2decoder (/dev/video* access)
-    privileged: true
+    # GPU access via nvidia-container-toolkit (WSL2)
+    runtime: nvidia
 
-    # GPU access
+    # Also declare deploy reservations for compose v2 compatibility
     deploy:
       resources:
         reservations:

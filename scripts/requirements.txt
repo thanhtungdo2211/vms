@@ -4,7 +4,7 @@ scikit-image
 fastapi 
 uvicorn
 pycuda
-tensorrt==10.3.0
+tensorrt==10.7.0
 
 psycopg2-binary
 qdrant-client
