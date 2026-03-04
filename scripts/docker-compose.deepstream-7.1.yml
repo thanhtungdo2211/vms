@@ -1,0 +1,46 @@
+# Docker Compose v2 configuration for VMSx VMS Core (WSL2 + DeepStream 8.0)
+services:
+  vmsx:
+    build:
+      context: ..
+      dockerfile: scripts/Dockerfile.deepstream-7.1
+    container_name: vmsx-face-spa
+    restart: unless-stopped
+    env_file:
+      - .env
+
+    # Mirrors: --privileged
+    privileged: true
+
+    # Mirrors: --gpus all
+    gpus: all
+
+    # Network configuration
+    network_mode: host
+
+    volumes:
+      - ..:/app
+      - /tmp/.X11-unix:/tmp/.X11-unix
+
+    # WSL2: Only /dev/dxg exists (no /dev/dri on WSL2)
+    devices:
+      - /dev/snd:/dev/snd
+
+    environment:
+      - CUDA_CACHE_DISABLE=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
+      # - NVIDIA_VISIBLE_DEVICES=all
+      # - NVIDIA_DRIVER_CAPABILITIES=all
+      - GST_DEBUG=${GST_DEBUG:-2,v4l2*:1}
+      - PYTHONUNBUFFERED=1
+      - DISPLAY=${DISPLAY:-:0}
+
+    stdin_open: true
+    tty: true
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/api/health", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
