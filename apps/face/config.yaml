@@ -1,16 +1,38 @@
+# ==========================================
+# Face Recognition Processor Configuration
+# ==========================================
+
+# ---- PostgreSQL Database ----
+database:
+  enabled: true
+  host: "192.168.6.229"
+  port: 5432
+  name: "iotvms_new"
+  user: "postgres"
+  password: "admin123"
+  # Full URL (used if provided, overrides host/port/name/user/password)
+  url: "postgresql://postgres:admin123@192.168.6.229:5432/iotvms_new"
+
+# ---- Qdrant Vector DB ----
+qdrant:
+  host: "192.168.6.16"
+  port: 6386
+  api_key: null
+  collection: "user_features_cosine"
+
 params:
   l2_threshold: 1.0
   min_streak: 3
 
   # ---- Recognition thresholds ----
-  pg_sim_high: 0.65          # was 0.58 — instant match chặt hơn
-  pg_sim_low: 0.52           # was 0.45 — voting chặt hơn
-  pg_sim_floor: 0.45         # was 0.40 — fallback Qdrant chặt hơn
-  qdrant_threshold: 0.50     # was 0.40 — Qdrant match chặt hơn
-  qdrant_low_threshold: 0.45 # was 0.40 — recheck chặt hơn
-  vote_threshold: 3          # was 2   — cần 3 votes thay vì 2
+  pg_sim_high: 0.65
+  pg_sim_low: 0.52
+  pg_sim_floor: 0.45
+  qdrant_threshold: 0.50
+  qdrant_low_threshold: 0.45
+  vote_threshold: 3
   stable_frames: 15
-  min_unknown_frames_before_create: 30  # was 20 — chờ lâu hơn
+  min_unknown_frames_before_create: 30
   recheck_cooldown_sec: 3.0
   qdrant_cooldown_sec: 5.0
 
@@ -47,8 +69,6 @@ muxer:
   batched-push-timeout: 40000
   live-source: 1
 
-# Demux BEFORE OSD - each camera gets its own OSD in RTSP chain
-# Architecture: mux → PGIE → Tracker → SGIE → nvstreamdemux → (per-cam: OSD → enc → RTSP)
 # elements:
 #   - type: queue
 #   - type: nvvideoconvert
@@ -84,9 +104,7 @@ elements:
     name: sgie
     config_file: "data/face/models/arcface/infer.txt"
     probes: {src: sgie_probe, sink: recognition_fps_probe}
-  - type: nvmultistreamtiler
-    properties: { rows: 2, columns: 2, width: 1920, height: 1080 }
-  - type: nvdsosd
-    properties: { process-mode: 0, display-text: 1 }
-    # probes: {src: recognition_fps_probe}
-  
+  # - type: nvmultistreamtiler
+  #   properties: { rows: 2, columns: 2, width: 1920, height: 1080 }
+  # - type: nvdsosd
+  #   properties: { process-mode: 0, display-text: 1 }

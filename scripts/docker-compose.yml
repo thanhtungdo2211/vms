@@ -27,7 +27,6 @@ services:
     volumes:
       # Mount project directory to both /app and original path for compatibility
       - ..:/app
-      # - /home/mq/disk2T/quangnv/face:/home/mq/disk2T/quangnv/face
 
     # Environment variables (from .env + defaults)
     environment:
@@ -43,7 +42,7 @@ services:
 
     # Health check
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8083/api/health", "||", "exit", "1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8085/api/health", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3

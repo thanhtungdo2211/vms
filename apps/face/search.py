@@ -6,7 +6,20 @@ from qdrant_client.models import PointStruct  # type: ignore
 
 from apps.face.qdrant_client_service import QdrantFeatureStorage
 
-feature_storage = QdrantFeatureStorage()
+# Lazy singleton — initialized on first use, AFTER config constants are set
+_feature_storage: QdrantFeatureStorage = None
+
+def _get_storage() -> QdrantFeatureStorage:
+    """Get or create the Qdrant storage singleton (lazy init)."""
+    global _feature_storage
+    if _feature_storage is None:
+        _feature_storage = QdrantFeatureStorage()
+    return _feature_storage
+
+def reinit_storage():
+    """Force re-initialize storage (call after changing QDRANT_HOST/PORT/etc.)."""
+    global _feature_storage
+    _feature_storage = QdrantFeatureStorage()
 
 
 def upsert(
@@ -16,6 +29,7 @@ def upsert(
 ) -> Dict[str, Any]:
     try:
         import numpy as np
+        feature_storage = _get_storage()
         points = []
         for feature_vector in features:
             if len(feature_vector) != 512:
@@ -50,13 +64,11 @@ def _do_search(query_vector_normalized: list, limit: int):
     """
     Search Qdrant using the best available API method.
     Supports both old (.search) and new (.query_points) qdrant-client versions.
-    
-    Returns list of ScoredPoint objects.
     """
+    feature_storage = _get_storage()
     client = feature_storage.client
     collection = feature_storage.collection_name
 
-    # Try .search() first (qdrant-client < 1.7)
     if hasattr(client, "search"):
         return client.search(
             collection_name=collection,
@@ -66,7 +78,6 @@ def _do_search(query_vector_normalized: list, limit: int):
             with_vectors=False,
         )
 
-    # Fallback to .query_points() (qdrant-client >= 1.7)
     if hasattr(client, "query_points"):
         result = client.query_points(
             collection_name=collection,
@@ -75,7 +86,6 @@ def _do_search(query_vector_normalized: list, limit: int):
             with_payload=True,
             with_vectors=False,
         )
-        # query_points returns QueryResponse with .points attribute
         if hasattr(result, "points"):
             return result.points
         return result
@@ -93,9 +103,6 @@ def search(
 ):
     """
     Search similar vectors in Qdrant.
-    - Compatible with all qdrant-client versions
-    - Collection metric must be Cosine for score ∈ [0, 1]
-    - Higher score = more similar
     """
     try:
         if len(query_vector) != 512:
@@ -108,10 +115,7 @@ def search(
             qv = qv / norm
 
         search_results = _do_search(qv.tolist(), limit)
-
-        # Filter by threshold (cosine: score ∈ [0,1], higher = better)
         hits = [res for res in search_results if res.score >= similarity_threshold]
-
         return hits
     except Exception as e:
         print(f"Search error: {e}")
@@ -152,13 +156,8 @@ def check_and_save_feature(
                     "person_id": best_pid or person_id
                 }
 
-        up = upsert(person_id=person_id,
-                     features=[fv.tolist()],
-                     camera_id=camera_id)
+        up = upsert(person_id=person_id, features=[fv.tolist()], camera_id=camera_id)
         return up
 
     except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+        return {"status": "error", "error": str(e)}

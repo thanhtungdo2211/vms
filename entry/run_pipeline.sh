@@ -32,4 +32,7 @@ echo "[3/3] Starting pipeline..."
 echo "============================================================"
 echo ""
 
-exec env GST_DEBUG="${GST_DEBUG:-0}" python3 entry/test_multi_branch_video.py
+# exec env GST_DEBUG="${GST_DEBUG:-0}" python3 entry/test_multi_branch_video.py
+exec env GST_DEBUG="${GST_DEBUG:-0}" \
+    NVBUF_DISABLE_IOCTL_PRINT=1 \
+    python3 entry/test_multi_branch_video.py

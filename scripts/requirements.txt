@@ -9,3 +9,6 @@ tensorrt==10.7.0
 psycopg2-binary
 qdrant-client
 requests
+
+numpy
+sqlalchemy

@@ -35,23 +35,16 @@ from src.common import BatchIterator, extract_embedding, get_batch_meta, fps_pro
 from apps.face.http_event_sender import HttpEventSender
 
 # Database imports
-try:
-    from apps.face.pg_database import SessionLocal
-    from apps.face.models_sql import AccessUser, AccessEvent
-    from sqlalchemy.orm import joinedload
-    from sqlalchemy import func
-    HAS_DB = True
-except ImportError:
-    HAS_DB = False
-    print("[WARN] SQL models not available, falling back to JSON features")
+from apps.face.pg_database import SessionLocal
+from apps.face.models_sql import AccessUser, AccessEvent
+from sqlalchemy.orm import joinedload
+from sqlalchemy import func
+HAS_DB = True
 
 # Qdrant imports
-try:
-    from apps.face.search import search as qdrant_search, upsert as qdrant_upsert
-    HAS_QDRANT = True
-except ImportError:
-    HAS_QDRANT = False
-    print("[WARN] Qdrant not available, Qdrant fallback disabled")
+from apps.face.search import search as qdrant_search, upsert as qdrant_upsert
+HAS_QDRANT = True
+
 
 
 # =============================================================================
@@ -291,10 +284,9 @@ class FaceDatabase:
     Manages registered face features for matching.
     
     Primary: Load from PostgreSQL AccessUser + user_features (in-memory cosine similarity)
-    Fallback: Load from JSON file
     """
 
-    def __init__(self, features_path: str = "", use_db: bool = True):
+    def __init__(self, db_url: str = None, use_db: bool = True):
         # Per-person data
         self.names: list[str] = []
         self.person_ids: list[str] = []
@@ -311,8 +303,6 @@ class FaceDatabase:
 
         if use_db and HAS_DB:
             self._load_from_db()
-        elif features_path:
-            self._load_from_json(features_path)
 
     # ---- PostgreSQL loader ----
 
@@ -499,55 +489,6 @@ class FaceDatabase:
                 qdrant_upsert(person_id=person_id, features=features, camera_id="import")
         except Exception as e:
             print(f"[FaceDB] Seed Qdrant error: {e}")
-
-    # # ---- JSON fallback loader ----
-
-    # def _load_from_json(self, path: str) -> None:
-    #     """Load pre-registered face features from JSON file"""
-    #     if not os.path.exists(path):
-    #         print(f"[FaceDB] Warning: Features file not found: {path}")
-    #         return
-
-    #     start = time.time()
-    #     with open(path, "r", encoding="utf-8") as f:
-    #         data = json.load(f)
-
-    #     names, person_ids, feats, owner_idx, pid_to_name = [], [], [], [], {}
-
-    #     for name, info in data.items():
-    #         if "feature" not in info:
-    #             continue
-    #         feat = info["feature"]
-    #         if isinstance(feat[0], list):
-    #             feat = feat[0]
-    #         vec = np.array(feat, dtype=np.float32)
-    #         norm = np.linalg.norm(vec)
-    #         if norm > 0:
-    #             vec = vec / norm
-
-    #         pid = info.get("person_id", name)
-    #         idx = len(names)
-    #         names.append(name)
-    #         person_ids.append(pid)
-    #         pid_to_name[pid] = name
-    #         feats.append(vec)
-    #         owner_idx.append(idx)
-
-    #         if "avatar" in info:
-    #             self.avatars[name] = info["avatar"]
-
-    #     with self._lock:
-    #         self.names = names
-    #         self.person_ids = person_ids
-    #         self.person_id_to_name = pid_to_name
-    #         if feats:
-    #             self.features_matrix = np.vstack(feats).astype(np.float32)
-    #         else:
-    #             self.features_matrix = np.empty((0, 512), dtype=np.float32)
-    #         self.features_owner_idx = owner_idx
-
-    #     print(f"[FaceDB] Loaded {len(self.names)} faces from JSON in "
-    #           f"{(time.time() - start) * 1000:.1f}ms")
 
     # ---- Matching ----
 
@@ -781,27 +722,13 @@ class EventSet:
 
 @ProcessorRegistry.register("recognition")
 class FaceRecognitionProcessor:
-    """
-    Face recognition processor — Hybrid matching pipeline.
-
-    Flow per face:
-    1. Extract embedding from SGIE tensor
-    2. (Optional) Check frontal face via landmarks
-    3. Cosine match against in-memory PostgreSQL features (fast)
-       - High score (>= pg_sim_high) → instant confirm
-       - Medium score (pg_sim_low ~ pg_sim_high) → voting
-    4. Low/no match → Qdrant fallback search
-    5. Still unknown after N frames → create new person_id, upsert to Qdrant
-    6. Periodic refresh of PG features (every refresh_interval seconds)
-    """
-
     def __init__(self, config: Dict[str, Any], sink: BaseSink, source_mapper=None):
         self._config = config
         self._sink = sink
         self._source_mapper = source_mapper
         params = config.get("params", {})
 
-        # ---- Thresholds (from face_infer.py) ----
+        # ---- Thresholds ----
         self.pg_sim_high = params.get("pg_sim_high", 0.58)
         self.pg_sim_low = params.get("pg_sim_low", 0.45)
         self.pg_sim_floor = params.get("pg_sim_floor", 0.40)
@@ -818,18 +745,35 @@ class FaceRecognitionProcessor:
         self.angle_threshold = params.get("angle_threshold", 15)
         self.symmetry_threshold = params.get("symmetry_threshold", 0.3)
         self.min_face_size = params.get("min_face_size", 50)
-        # Frame shape for landmark scaling — set from first frame or config
-        self.frame_shape = None  # Will be set dynamically if needed
+        self.frame_shape = None
 
         # ---- Alert cooldown ----
         self.alert_cooldown_sec = params.get("alert_cooldown_sec", 20)
         self.last_alert_at: Dict[tuple, float] = {}
 
-        # ---- Load face database ----
-        features_path = params.get("features_json", "data/face/features.json")
-        use_db = params.get("use_db", True) and HAS_DB
+        # ---- Database config ----
+        db_cfg = config.get("database", {})
+        use_db = db_cfg.get("enabled", True) and HAS_DB
+
+        # ---- Qdrant config (override module-level constants) ----
+        qdrant_cfg = config.get("qdrant", {})
+        if qdrant_cfg:
+            import apps.face.qdrant_client_service as _qcs
+            from apps.face.search import reinit_storage
+            if qdrant_cfg.get("host"):
+                _qcs.QDRANT_HOST = qdrant_cfg["host"]
+            if qdrant_cfg.get("port"):
+                _qcs.QDRANT_PORT = int(qdrant_cfg["port"])
+            if qdrant_cfg.get("api_key"):
+                _qcs.QDRANT_API_KEY = qdrant_cfg["api_key"]
+            if qdrant_cfg.get("collection"):
+                _qcs.COLLECTION_NAME = qdrant_cfg["collection"]
+            # Re-initialize storage with updated config
+            reinit_storage()
         print(f"[FaceRecognitionProcessor] use_db={use_db}, HAS_DB={HAS_DB}, HAS_QDRANT={HAS_QDRANT}")
-        self._db = FaceDatabase(features_path=features_path, use_db=use_db)
+
+        # ---- Load face database ----
+        self._db = FaceDatabase(use_db=use_db)
 
         # ---- Tracker manager & event tracking ----
         self._trackers = TrackerManager(params)
@@ -837,7 +781,7 @@ class FaceRecognitionProcessor:
 
         # ---- New person management ----
         self.pending_new: Dict[tuple, dict] = {}
-        self.new_person_cache: Dict[str, tuple] = {}  # pid -> (avg_feat, timestamp)
+        self.new_person_cache: Dict[str, tuple] = {}
         self.flush_interval_sec = params.get("flush_interval_sec", 5)
 
         # ---- Cleanup runner ----
@@ -856,7 +800,7 @@ class FaceRecognitionProcessor:
         os.makedirs(CROP_FACE_DIR, exist_ok=True)
         os.makedirs(FULL_FRAME_DIR, exist_ok=True)
 
-        # ---- Pending HTTP events (queued by _send_event, consumed by _sgie_probe) ----
+        # ---- Pending HTTP events ----
         self._pending_http_events: Dict[tuple, dict] = {}
 
         print(f"[FaceRecognitionProcessor] Initialized: "
@@ -950,24 +894,24 @@ class FaceRecognitionProcessor:
             event_info = self._pending_http_events.pop(key)
 
             # Extract full frame (cached per batch_id to avoid redundant extraction)
-            if frame.batch_id not in frame_cache:
-                extracted = extract_frame(gst_buffer, frame)
-                if extracted is not None:
-                    frame_cache[frame.batch_id] = extracted
+            # if frame.batch_id not in frame_cache:
+            #     extracted = extract_frame(gst_buffer, frame)
+            #     if extracted is not None:
+            #         frame_cache[frame.batch_id] = extracted
 
-            full_frame = frame_cache.get(frame.batch_id)
-            if full_frame is None:
-                print(f"[SgieProbe] Cannot extract frame batch_id={frame.batch_id}")
-                continue
+            # full_frame = frame_cache.get(frame.batch_id)
+            # if full_frame is None:
+            #     print(f"[SgieProbe] Cannot extract frame batch_id={frame.batch_id}")
+            #     continue
 
-            # Crop face from full frame
-            face_crop = crop_face_from_obj(full_frame, obj)
-            if face_crop is None:
-                print(f"[SgieProbe] Cannot crop face oid={obj.object_id}")
-                continue
+            # # Crop face from full frame
+            # face_crop = crop_face_from_obj(full_frame, obj)
+            # if face_crop is None:
+            #     print(f"[SgieProbe] Cannot crop face oid={obj.object_id}")
+            #     continue
 
-            # Save images + send HTTP event (non-blocking)
-            self._save_and_send_http(event_info, full_frame, face_crop)
+            # # Save images + send HTTP event (non-blocking)
+            # self._save_and_send_http(event_info, full_frame, face_crop)
 
         return Gst.PadProbeReturn.OK
 
