@@ -131,7 +131,7 @@ class HttpEventSender:
             "full_jpg": full_jpg.tobytes(),
         }
 
-        print("===> Camera", event.get("stream_id"))
+        # print("===> Camera", event.get("stream_id"))
         
         try:
             self._queue.put_nowait(event)

@@ -36,7 +36,10 @@ class QdrantFeatureStorage:
         self.client = QdrantClient(
             host=QDRANT_HOST,
             port=QDRANT_PORT,
-            api_key=QDRANT_API_KEY if QDRANT_API_KEY else None
+            api_key=QDRANT_API_KEY if QDRANT_API_KEY else None,
+            prefer_grpc=False,   # Force REST - gRPC port 6334 is NOT exposed
+            https=False,
+            timeout=30,
         )
         self.collection_name = COLLECTION_NAME
         self._ensure_collection_exists()

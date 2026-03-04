@@ -894,24 +894,24 @@ class FaceRecognitionProcessor:
             event_info = self._pending_http_events.pop(key)
 
             # Extract full frame (cached per batch_id to avoid redundant extraction)
-            # if frame.batch_id not in frame_cache:
-            #     extracted = extract_frame(gst_buffer, frame)
-            #     if extracted is not None:
-            #         frame_cache[frame.batch_id] = extracted
+            if frame.batch_id not in frame_cache:
+                extracted = extract_frame(gst_buffer, frame)
+                if extracted is not None:
+                    frame_cache[frame.batch_id] = extracted
 
-            # full_frame = frame_cache.get(frame.batch_id)
-            # if full_frame is None:
-            #     print(f"[SgieProbe] Cannot extract frame batch_id={frame.batch_id}")
-            #     continue
+            full_frame = frame_cache.get(frame.batch_id)
+            if full_frame is None:
+                print(f"[SgieProbe] Cannot extract frame batch_id={frame.batch_id}")
+                continue
 
-            # # Crop face from full frame
-            # face_crop = crop_face_from_obj(full_frame, obj)
-            # if face_crop is None:
-            #     print(f"[SgieProbe] Cannot crop face oid={obj.object_id}")
-            #     continue
+            # Crop face from full frame
+            face_crop = crop_face_from_obj(full_frame, obj)
+            if face_crop is None:
+                print(f"[SgieProbe] Cannot crop face oid={obj.object_id}")
+                continue
 
-            # # Save images + send HTTP event (non-blocking)
-            # self._save_and_send_http(event_info, full_frame, face_crop)
+            # Save images + send HTTP event (non-blocking)
+            self._save_and_send_http(event_info, full_frame, face_crop)
 
         return Gst.PadProbeReturn.OK
 
@@ -950,8 +950,8 @@ class FaceRecognitionProcessor:
 
         # ----- Hybrid matching -----
         person_id, name = self._match_face(emb, source_id, oid, trk, frame)
-        # print("====> P_ID", person_id)
-        # print("====> NAME", name)
+        print("====> P_ID", person_id)
+        print("====> NAME", name)
         if person_id:
             return name or person_id, "confirmed", trk.score
         return "", "unknown", 0.0
