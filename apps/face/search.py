@@ -1,25 +1,38 @@
 import uuid
 import time
-from typing import List, Union, Any, Dict
+from typing import List, Union, Any, Dict, Optional
 
 from qdrant_client.models import PointStruct  # type: ignore
 
 from apps.face.qdrant_client_service import QdrantFeatureStorage
 
 # Lazy singleton — initialized on first use, AFTER config constants are set
-_feature_storage: QdrantFeatureStorage = None
+_feature_storage: Optional[QdrantFeatureStorage] = None
 
-def _get_storage() -> QdrantFeatureStorage:
-    """Get or create the Qdrant storage singleton (lazy init)."""
+def _get_storage() -> Optional[QdrantFeatureStorage]:
+    """Get or create the Qdrant storage singleton (lazy init). Returns None if unavailable."""
     global _feature_storage
     if _feature_storage is None:
-        _feature_storage = QdrantFeatureStorage()
+        try:
+            _feature_storage = QdrantFeatureStorage()
+        except Exception as e:
+            print(f"[Qdrant] Failed to initialize storage: {e}")
+            _feature_storage = None
     return _feature_storage
 
 def reinit_storage():
     """Force re-initialize storage (call after changing QDRANT_HOST/PORT/etc.)."""
     global _feature_storage
-    _feature_storage = QdrantFeatureStorage()
+    try:
+        _feature_storage = QdrantFeatureStorage()
+    except Exception as e:
+        print(f"[Qdrant] Failed to reinitialize storage: {e}")
+        _feature_storage = None
+
+def is_available() -> bool:
+    """Check if Qdrant is available."""
+    storage = _get_storage()
+    return storage is not None and storage.is_available
 
 
 def upsert(
@@ -30,6 +43,9 @@ def upsert(
     try:
         import numpy as np
         feature_storage = _get_storage()
+        if not feature_storage or not feature_storage.is_available:
+            return {"status": "error", "error": "Qdrant not available", "upserted_count": 0}
+        
         points = []
         for feature_vector in features:
             if len(feature_vector) != 512:
@@ -66,6 +82,9 @@ def _do_search(query_vector_normalized: list, limit: int):
     Supports both old (.search) and new (.query_points) qdrant-client versions.
     """
     feature_storage = _get_storage()
+    if not feature_storage or not feature_storage.is_available:
+        return []
+    
     client = feature_storage.client
     collection = feature_storage.collection_name
 
@@ -102,9 +121,12 @@ def search(
     similarity_threshold: float = 0.45
 ):
     """
-    Search similar vectors in Qdrant.
+    Search similar vectors in Qdrant. Returns empty list if Qdrant unavailable.
     """
     try:
+        if not is_available():
+            return []
+        
         if len(query_vector) != 512:
             raise ValueError(f"Query vector must be 512-dimensional, got {len(query_vector)}")
 
@@ -134,6 +156,9 @@ def check_and_save_feature(
     if not, upsert into Qdrant.
     """
     try:
+        if not is_available():
+            return {"status": "error", "error": "Qdrant not available"}
+        
         import numpy as np
         fv = np.array(feature_vector, dtype=np.float32)
         norm = np.linalg.norm(fv)

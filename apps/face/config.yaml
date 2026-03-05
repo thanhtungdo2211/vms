@@ -65,7 +65,7 @@ muxer:
   batch-size: 16
   width: 1920
   height: 1080
-  nvbuf-memory-type: 0
+  nvbuf-memory-type: 1
   batched-push-timeout: 40000
   live-source: 1
 

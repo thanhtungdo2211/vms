@@ -42,7 +42,7 @@ from sqlalchemy import func
 HAS_DB = True
 
 # Qdrant imports
-from apps.face.search import search as qdrant_search, upsert as qdrant_upsert
+from apps.face.search import search as qdrant_search, upsert as qdrant_upsert, is_available as qdrant_is_available
 HAS_QDRANT = True
 
 
@@ -404,7 +404,7 @@ class FaceDatabase:
         pid = None
 
         # Step 1: Try to find existing person_id from Qdrant
-        if HAS_QDRANT and feats_np.shape[0] > 0:
+        if HAS_QDRANT and qdrant_is_available() and feats_np.shape[0] > 0:
             try:
                 candidate_ids = []
                 scores = {}
@@ -463,7 +463,7 @@ class FaceDatabase:
         if not pid:
             pid = str(uuid.uuid4())
             # Seed Qdrant with this user's features
-            if HAS_QDRANT and feats_np.shape[0] > 0:
+            if HAS_QDRANT and qdrant_is_available() and feats_np.shape[0] > 0:
                 threading.Thread(
                     target=self._seed_qdrant,
                     args=(pid, feats_np),
@@ -770,7 +770,10 @@ class FaceRecognitionProcessor:
                 _qcs.COLLECTION_NAME = qdrant_cfg["collection"]
             # Re-initialize storage with updated config
             reinit_storage()
-        print(f"[FaceRecognitionProcessor] use_db={use_db}, HAS_DB={HAS_DB}, HAS_QDRANT={HAS_QDRANT}")
+        
+        # Check Qdrant availability
+        qdrant_available = HAS_QDRANT and qdrant_is_available()
+        print(f"[FaceRecognitionProcessor] use_db={use_db}, HAS_DB={HAS_DB}, HAS_QDRANT={HAS_QDRANT}, Qdrant_Available={qdrant_available}")
 
         # ---- Load face database ----
         self._db = FaceDatabase(use_db=use_db)
@@ -990,7 +993,7 @@ class FaceRecognitionProcessor:
                 return best_pid, best_name
 
         # ---- Step C: Qdrant fallback ----
-        if HAS_QDRANT and (best_sim < self.pg_sim_floor or not best_pid):
+        if HAS_QDRANT and qdrant_is_available() and (best_sim < self.pg_sim_floor or not best_pid):
             now = time.time()
             if (now - trk.last_qdrant_time) >= self.qdrant_cooldown_sec:
                 trk.last_qdrant_time = now
@@ -1002,7 +1005,7 @@ class FaceRecognitionProcessor:
                     return q_pid, q_name
 
         # ---- Step D: Create new person if unknown for too long ----
-        if HAS_QDRANT:
+        if HAS_QDRANT and qdrant_is_available():
             new_result = self._handle_unknown(embedding, source_id, oid, trk, frame)
             if new_result:
                 return new_result
@@ -1209,7 +1212,7 @@ class FaceRecognitionProcessor:
 
     def _flush_new_persons(self) -> None:
         """Flush new person features to Qdrant (async)."""
-        if not HAS_QDRANT:
+        if not HAS_QDRANT or not qdrant_is_available():
             return
         now = time.time()
         to_remove = []
@@ -1369,7 +1372,7 @@ class FaceRecognitionProcessor:
             "trackers_confirmed": confirmed,
             "trackers_pending": pending,
             "pending_new_persons": len(self.pending_new),
-            "qdrant_available": HAS_QDRANT,
+            "qdrant_available": HAS_QDRANT and qdrant_is_available(),
             "db_available": HAS_DB,
             "frontal_check": self.check_frontal,
         }
