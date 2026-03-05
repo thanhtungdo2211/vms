@@ -24,6 +24,7 @@ import numpy as np
 import cv2
 import pyds
 from datetime import datetime
+from queue import Queue, Full
 
 import gi
 gi.require_version("Gst", "1.0")
@@ -73,35 +74,6 @@ FULL_FRAME_DIR = "data/face/full-frame"
 # =============================================================================
 # Frame Extraction Helpers
 # =============================================================================
-
-def extract_frame(gst_buffer, frame_meta) -> Optional[np.ndarray]:
-    """Extract BGR numpy frame from GStreamer buffer. Returns None on failure."""
-    batch_id = frame_meta.batch_id
-    try:
-        n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), batch_id)
-        frame_copy = np.array(n_frame, copy=True, order='C')
-        frame_copy = cv2.cvtColor(frame_copy, cv2.COLOR_RGBA2BGR)
-        pyds.unmap_nvds_buf_surface(hash(gst_buffer), batch_id)
-        return frame_copy
-    except Exception as e:
-        print(f"[ExtractFrame] ERROR batch_id={batch_id}: {e}")
-        return None
-
-
-def crop_face_from_obj(frame: np.ndarray, obj_meta, padding: float = 0.1) -> Optional[np.ndarray]:
-    """Crop face region from frame with padding. Returns None if invalid."""
-    rect = obj_meta.rect_params
-    h, w = frame.shape[:2]
-    pad_w = int(rect.width * padding)
-    pad_h = int(rect.height * padding)
-    x1 = max(0, int(rect.left) - pad_w)
-    y1 = max(0, int(rect.top) - pad_h)
-    x2 = min(w, int(rect.left + rect.width) + pad_w)
-    y2 = min(h, int(rect.top + rect.height) + pad_h)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return frame[y1:y2, x1:x2].copy()
-
 
 def save_image(img: np.ndarray, directory: str, prefix: str) -> Optional[str]:
     """Save image to directory. Returns filepath or None."""
@@ -805,7 +777,10 @@ class FaceRecognitionProcessor:
 
         # ---- Pending HTTP events ----
         self._pending_http_events: Dict[tuple, dict] = {}
-
+        self._frame_event_queue: Queue = Queue(maxsize=50)
+        self._frame_dispatcher_running = False
+        self._frame_dispatcher_thread: Optional[threading.Thread] = None
+        
         print(f"[FaceRecognitionProcessor] Initialized: "
               f"{len(self._db.names)} users, "
               f"{self._db.features_matrix.shape[0]} vectors, "
@@ -868,7 +843,7 @@ class FaceRecognitionProcessor:
         return Gst.PadProbeReturn.OK
 
     def _sgie_probe(self, pad, info, user_data) -> Gst.PadProbeReturn:
-        """Process recognition results, extract frames, crop faces, and send HTTP events"""
+        """Process recognition results; queue events for frame dispatcher (appsink)."""
         gst_buffer = info.get_buffer()
         batch = get_batch_meta(gst_buffer)
         if not batch:
@@ -883,41 +858,55 @@ class FaceRecognitionProcessor:
         # Periodic flush new persons to Qdrant
         self._flush_new_persons()
 
-        frame_cache: Dict[int, np.ndarray] = {}
-
         for frame, obj in BatchIterator(batch):
             name, state, score = self._process_face(frame.source_id, obj, frame.frame_num)
             update_display(obj, name, score, state)
 
-            # Check if _send_event queued an HTTP event for this face
             key = (frame.source_id, obj.object_id)
             if key not in self._pending_http_events:
                 continue
 
             event_info = self._pending_http_events.pop(key)
+            rect = obj.rect_params
+            bbox = (int(rect.left), int(rect.top), int(rect.width), int(rect.height))
 
-            # Extract full frame (cached per batch_id to avoid redundant extraction)
-            if frame.batch_id not in frame_cache:
-                extracted = extract_frame(gst_buffer, frame)
-                if extracted is not None:
-                    frame_cache[frame.batch_id] = extracted
-
-            full_frame = frame_cache.get(frame.batch_id)
-            if full_frame is None:
-                print(f"[SgieProbe] Cannot extract frame batch_id={frame.batch_id}")
-                continue
-
-            # Crop face from full frame
-            face_crop = crop_face_from_obj(full_frame, obj)
-            if face_crop is None:
-                print(f"[SgieProbe] Cannot crop face oid={obj.object_id}")
-                continue
-
-            # Save images + send HTTP event (non-blocking)
-            self._save_and_send_http(event_info, full_frame, face_crop)
+            try:
+                self._frame_event_queue.put_nowait({
+                    "event_info": event_info,
+                    "bbox": bbox,
+                })
+            except Full:
+                print(f"[SgieProbe] Frame event queue full, dropping event for {key}")
 
         return Gst.PadProbeReturn.OK
 
+    def _frame_dispatcher_worker(self) -> None:
+        """Background thread: get latest frame from appsink, crop face, send HTTP event."""
+        while self._frame_dispatcher_running:
+            try:
+                item = self._frame_event_queue.get(timeout=0.5)
+            except Exception:
+                continue
+
+            full_frame = None
+            if hasattr(self._sink, "get_latest_frame"):
+                full_frame = self._sink.get_latest_frame()
+
+            if full_frame is None:
+                print("[FrameDispatcher] No frame from appsink, dropping event")
+                continue
+
+            l, t, w, h = item["bbox"]
+            h_img, w_img = full_frame.shape[:2]
+            padding = 0.1
+            x1 = max(0, int(l - w * padding))
+            y1 = max(0, int(t - h * padding))
+            x2 = min(w_img, int(l + w + w * padding))
+            y2 = min(h_img, int(t + h + h * padding))
+            face_crop = full_frame[y1:y2, x1:x2] if (x2 > x1 and y2 > y1) else full_frame
+
+            self._save_and_send_http(item["event_info"], full_frame, face_crop)                 
+    
     # =========================================================================
     # Face Processing Pipeline
     # =========================================================================
@@ -1347,18 +1336,28 @@ class FaceRecognitionProcessor:
         print(f"[FaceRecognitionProcessor] Pipeline built, branch: {branch_info.name}")
 
     def on_start(self) -> None:
-        """Start cleanup timer and HTTP sender when pipeline starts"""
         if self._cleanup_runner:
             self._cleanup_runner.start()
         self._http_sender.start()
+        # Start frame event dispatcher
+        self._frame_dispatcher_running = True
+        self._frame_dispatcher_thread = threading.Thread(
+            target=self._frame_dispatcher_worker,
+            daemon=True,
+            name="frame-event-dispatcher",
+        )
+        self._frame_dispatcher_thread.start()
         print("[FaceRecognitionProcessor] Started")
 
     def on_stop(self) -> None:
-        """Stop cleanup timer and HTTP sender when pipeline stops"""
         if self._cleanup_runner:
             self._cleanup_runner.stop()
         self._http_sender.stop()
-        # Flush remaining new persons
+        # Stop frame event dispatcher
+        self._frame_dispatcher_running = False
+        if self._frame_dispatcher_thread:
+            self._frame_dispatcher_thread.join(timeout=3.0)
+            self._frame_dispatcher_thread = None
         self._flush_new_persons()
         print("[FaceRecognitionProcessor] Stopped")
 

@@ -39,7 +39,7 @@ def detect_platform() -> PlatformInfo:
     is_jetson = os.path.exists("/etc/nv_tegra_release") or os.path.exists("/proc/device-tree/model")
     if is_jetson:
         return PlatformInfo(True, "jetson", 0, "", 2)
-    return PlatformInfo(False, "dgpu", 1, "nvv4l2h264enc", 1)
+    return PlatformInfo(False, "dgpu", 2, "nvv4l2h264enc", 1)
 
 
 def get_encoder_element(bitrate: int) -> Tuple[str, dict]:

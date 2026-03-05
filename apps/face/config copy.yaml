@@ -1,3 +1,9 @@
+
+
+
+
+
+
 # ==========================================
 # Face Recognition Processor Configuration
 # ==========================================
@@ -53,20 +59,21 @@ params:
 #   properties:
 #     sync: false
 
-sink:
-  enable: true
-  type: appsink   # appsink captures frames as numpy for face crop/HTTP events
-  properties:
-    max-buffers: 2
-    drop: true
-
 # sink:
 #   enable: true
-#   type: multifilesink
+#   type: fakesink   # Các loại: filesink, fakesink, rtsp, display
 #   properties:
-#     location: "data/face/test-output2/frame_%05d.jpg"
-#     max-files: 100
-#     quality: 85
+#     location: "${OUTPUT_DIR:data/face/output_recognition.avi}"
+#     sync: false
+#     qos: false
+
+sink:
+  enable: true
+  type: multifilesink
+  properties:
+    location: "data/face/test-output2/frame_%05d.jpg"
+    max-files: 100
+    quality: 85
 
 muxer:
   batch-size: 16
@@ -144,10 +151,3 @@ elements:
     name: sgie
     config_file: "data/face/models/arcface/infer.txt"
     probes: {src: sgie_probe, sink: recognition_fps_probe}
-  # - type: nvvideoconvert
-  #   name: pre_tiler_conv2
-  #   properties:
-  #     nvbuf-memory-type: 3
-  # - type: capsfilter
-  #   name: rgba_caps2
-  #   caps: "video/x-raw, format=I420"

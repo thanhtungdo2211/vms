@@ -1,46 +1,50 @@
-# Docker Compose v2 configuration for VMSx VMS Core (WSL2 + DeepStream 8.0)
+# Docker Compose v2 configuration for VMSx VMS Core
 services:
   vmsx:
     build:
       context: ..
-      dockerfile: scripts/Dockerfile.deepstream-7.1
-    container_name: vmsx-face-spa
+      dockerfile: scripts/Dockerfile
+    container_name: vmsx
     restart: unless-stopped
     env_file:
       - .env
 
-    # Mirrors: --privileged
+    # Privileged mode required for nvv4l2decoder (/dev/video* access)
     privileged: true
 
-    # Mirrors: --gpus all
-    gpus: all
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
 
     # Network configuration
     network_mode: host
 
     volumes:
+      # Mount project directory to both /app and original path for compatibility
       - ..:/app
-      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /home/mq/disk2T/quangnv/face:/home/mq/disk2T/quangnv/face
 
-    # WSL2: Only /dev/dxg exists (no /dev/dri on WSL2)
-    devices:
-      - /dev/snd:/dev/snd
-
+    # Environment variables (from .env + defaults)
     environment:
-      - CUDA_CACHE_DISABLE=0
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
-      # - NVIDIA_VISIBLE_DEVICES=all
-      # - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
       - GST_DEBUG=${GST_DEBUG:-2,v4l2*:1}
       - PYTHONUNBUFFERED=1
       - DISPLAY=${DISPLAY:-:0}
 
+    # Interactive mode for debugging
     stdin_open: true
     tty: true
 
+    # Health check
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8085/api/health", "||", "exit", "1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8083/api/health", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 10s

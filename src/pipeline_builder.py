@@ -21,7 +21,7 @@ from gi.repository import GLib
 if "/opt/nvidia/deepstream/deepstream/lib" not in sys.path:
     sys.path.append("/opt/nvidia/deepstream/deepstream/lib")
 
-from src.common import load_config, make_element, get_nvvidconv_props, link_chain
+from src.common import load_config, make_element, get_nvvidconv_props, link_chain, detect_platform
 from src.probe_registry import ProbeRegistry
 from src.processor_registry import BranchProcessor, ProcessorRegistry
 from src.sinks.base_sink import BaseSink
@@ -136,6 +136,20 @@ class PipelineBuilder:
             if s_type == "filesink":
                 loc = s_props.get("location") or f"{out_dir}/output_{name}.avi"
                 sinks[name] = FilesinkAdapter(location=loc)
+            elif s_type == "multifilesink":
+                from src.sinks.multifilesink_adapter import MultifilesinkAdapter
+                loc = s_props.get("location", f"{out_dir}/frame_%05d.jpg")
+                sinks[name] = MultifilesinkAdapter(
+                    location=loc,
+                    max_files=s_props.get("max-files", 100),
+                    quality=s_props.get("quality", 85),
+                )
+            elif s_type == "appsink":
+                from src.sinks.appsink_adapter import AppsinkAdapter
+                sinks[name] = AppsinkAdapter(
+                    max_buffers=s_props.get("max-buffers", 2),
+                    drop=s_props.get("drop", True),
+                )
             else:
                 sinks[name] = FakesinkAdapter()
         return sinks
@@ -279,9 +293,9 @@ class PipelineBuilder:
             props = {**props, "caps": Gst.Caps.from_string(cfg["caps"])}
 
         # Apply platform-specific properties for nvvideoconvert
-        if elem_type == "nvvideoconvert":
-            platform_props = get_nvvidconv_props()
-            props = {**platform_props, **props}
+        # if elem_type == "nvvideoconvert":
+        #     platform_props = get_nvvidconv_props()
+        #     props = {**platform_props, **props}
 
         elem = make_element(elem_type, name, props)
 
