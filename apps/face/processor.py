@@ -780,6 +780,7 @@ class FaceRecognitionProcessor:
         self._frame_event_queue: Queue = Queue(maxsize=50)
         self._frame_dispatcher_running = False
         self._frame_dispatcher_thread: Optional[threading.Thread] = None
+        self._connected_sources: set = set()
         
         print(f"[FaceRecognitionProcessor] Initialized: "
               f"{len(self._db.names)} users, "
@@ -859,10 +860,17 @@ class FaceRecognitionProcessor:
         self._flush_new_persons()
 
         for frame, obj in BatchIterator(batch):
-            name, state, score = self._process_face(frame.source_id, obj, frame.frame_num)
+            sid = frame.source_id
+
+            # Auto-connect appsink chain for new sources
+            if sid not in self._connected_sources and hasattr(self._sink, "connect_source"):
+                if self._sink.connect_source(sid):
+                    self._connected_sources.add(sid)
+
+            name, state, score = self._process_face(sid, obj, frame.frame_num)
             update_display(obj, name, score, state)
 
-            key = (frame.source_id, obj.object_id)
+            key = (sid, obj.object_id)
             if key not in self._pending_http_events:
                 continue
 
@@ -874,6 +882,7 @@ class FaceRecognitionProcessor:
                 self._frame_event_queue.put_nowait({
                     "event_info": event_info,
                     "bbox": bbox,
+                    "source_id": sid,
                 })
             except Full:
                 print(f"[SgieProbe] Frame event queue full, dropping event for {key}")
@@ -881,19 +890,23 @@ class FaceRecognitionProcessor:
         return Gst.PadProbeReturn.OK
 
     def _frame_dispatcher_worker(self) -> None:
-        """Background thread: get latest frame from appsink, crop face, send HTTP event."""
+        """Background thread: get frame from per-camera appsink, crop face, send HTTP event."""
         while self._frame_dispatcher_running:
             try:
                 item = self._frame_event_queue.get(timeout=0.5)
             except Exception:
                 continue
 
+            sid = item.get("source_id")
             full_frame = None
-            if hasattr(self._sink, "get_latest_frame"):
+
+            if hasattr(self._sink, "get_frame") and sid is not None:
+                full_frame = self._sink.get_frame(sid)
+            elif hasattr(self._sink, "get_latest_frame"):
                 full_frame = self._sink.get_latest_frame()
 
             if full_frame is None:
-                print("[FrameDispatcher] No frame from appsink, dropping event")
+                print(f"[FrameDispatcher] No frame for source {sid}, dropping event")
                 continue
 
             l, t, w, h = item["bbox"]

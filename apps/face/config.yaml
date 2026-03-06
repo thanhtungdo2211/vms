@@ -47,26 +47,13 @@ params:
     stream_id: 1
     timeout: 60.0
 
-# sink:
-#   enable: true
-#   type: filesink   # Main sink is fakesink, real output via demux RTSP
-#   properties:
-#     sync: false
-
 sink:
   enable: true
-  type: appsink   # appsink captures frames as numpy for face crop/HTTP events
+  type: appsink   # demux + per-camera appsink for face crop/HTTP events
   properties:
     max-buffers: 2
     drop: true
-
-# sink:
-#   enable: true
-#   type: multifilesink
-#   properties:
-#     location: "data/face/test-output2/frame_%05d.jpg"
-#     max-files: 100
-#     quality: 85
+    max-cameras: 16
 
 muxer:
   batch-size: 16
@@ -75,53 +62,6 @@ muxer:
   nvbuf-memory-type: 2
   batched-push-timeout: 40000
   live-source: 1
-
-# elements:
-#   - type: queue
-#   - type: nvvideoconvert
-#     name: pre_tiler_conv
-#   - type: capsfilter
-#     name: rgba_caps
-#     caps: "video/x-raw(memory:NVMM), format=RGBA"
-#   - type: nvinfer
-#     config_file: "data/face/models/scrfd640/infer.txt"
-#   - type: nvtracker
-#     config_file: "data/face/models/NvDCF/config_tracker.txt"
-#     probes: {src: tracker_probe}
-#   - type: nvinfer
-#     config_file: "data/face/models/arcface/infer.txt"
-#     probes: {src: sgie_probe, sink: recognition_fps_probe}
-#   - type: nvstreamdemux
-
-# elements:
-#   - type: queue
-#   - type: nvvideoconvert
-#     name: pre_tiler_conv
-#   - type: capsfilter
-#     name: rgba_caps
-#     caps: "video/x-raw(memory:NVMM), format=RGBA"
-#   - type: nvinfer
-#     name: pgie
-#     config_file: "data/face/models/scrfd640/infer.txt"
-#   - type: nvtracker
-#     name: tracker
-#     config_file: "data/face/models/NvDCF/config_tracker.txt"
-#     probes: {src: tracker_probe}
-#   - type: nvinfer
-#     name: sgie
-#     config_file: "data/face/models/arcface/infer.txt"
-#     probes: {src: sgie_probe, sink: recognition_fps_probe}
-  # - type: nvvideoconvert
-  #   name: pre_tiler_conv2
-  #   properties:
-  #     nvbuf-memory-type: 3
-  # # - type: capsfilter
-  # #   name: rgba_caps2
-  # #   caps: "video/x-raw(memory:NVMM), format=RGBA"
-  # - type: nvmultistreamtiler
-  #   properties: { rows: 2, columns: 2, width: 1920, height: 1080 }
-  # - type: nvdsosd
-  #   properties: { process-mode: 0, display-text: 1 }
 
 elements:
   - type: queue
@@ -144,10 +84,3 @@ elements:
     name: sgie
     config_file: "data/face/models/arcface/infer.txt"
     probes: {src: sgie_probe, sink: recognition_fps_probe}
-  # - type: nvvideoconvert
-  #   name: pre_tiler_conv2
-  #   properties:
-  #     nvbuf-memory-type: 3
-  # - type: capsfilter
-  #   name: rgba_caps2
-  #   caps: "video/x-raw, format=I420"

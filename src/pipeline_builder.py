@@ -149,6 +149,7 @@ class PipelineBuilder:
                 sinks[name] = AppsinkAdapter(
                     max_buffers=s_props.get("max-buffers", 2),
                     drop=s_props.get("drop", True),
+                    max_cameras=s_props.get("max-cameras", 16),
                 )
             else:
                 sinks[name] = FakesinkAdapter()
