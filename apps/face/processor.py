@@ -58,6 +58,10 @@ COLOR_UNKNOWN = (1.0, 0.5, 0.0, 1.0)    # Orange
 COLOR_TEXT = (1.0, 1.0, 1.0, 1.0)       # White
 COLOR_TEXT_BG = (0.0, 0.0, 0.0, 0.7)    # Black transparent
 
+CV_COLOR_KNOWN = (0, 255, 0)      # BGR
+CV_COLOR_UNKNOWN = (0, 128, 255)  # BGR
+CV_COLOR_TEXT = (255, 255, 255)
+
 # Display settings
 BORDER_WIDTH = 3
 FONT_SIZE = 14
@@ -87,6 +91,65 @@ def save_image(img: np.ndarray, directory: str, prefix: str) -> Optional[str]:
         return None
     return filepath
 
+
+def _is_unknown_identity(name: Optional[str], person_id: Optional[str]) -> bool:
+    n = (name or "").strip().lower()
+    if n in {"", "unknown", "unknow", "none", "null", "Unknown"}:
+        return True
+    if person_id and name and person_id.strip() == name.strip():
+        return True
+    return False
+
+
+def draw_event_bbox(frame: np.ndarray, obj_meta, name: str, person_id: Optional[str]) -> None:
+    h, w = frame.shape[:2]
+
+    if isinstance(obj_meta, dict):
+        left = float(obj_meta.get("left", 0.0))
+        top = float(obj_meta.get("top", 0.0))
+        width = float(obj_meta.get("width", 0.0))
+        height = float(obj_meta.get("height", 0.0))
+    else:
+        rect = getattr(obj_meta, "rect_params", None)
+        if rect is None:
+            return
+        left = float(rect.left)
+        top = float(rect.top)
+        width = float(rect.width)
+        height = float(rect.height)
+
+    x1 = max(0, int(left))
+    y1 = max(0, int(top))
+    x2 = min(w - 1, int(left + width))
+    y2 = min(h - 1, int(top + height))
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    unknown = _is_unknown_identity(name, person_id)
+    color = CV_COLOR_UNKNOWN if unknown else CV_COLOR_KNOWN
+    label = "Unknown" if unknown else (name or "Unknown")
+    text = f"{label} [{x2 - x1}x{y2 - y1}]"
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.6
+    thickness = 2
+    (tw, th), base = cv2.getTextSize(text, font, scale, thickness)
+
+    tx = x1
+    ty = y1 - 8
+    if ty - th - base < 0:
+        ty = min(h - base - 2, y1 + th + base + 8)
+
+    cv2.rectangle(
+        frame,
+        (max(0, tx - 2), max(0, ty - th - base - 2)),
+        (min(w - 1, tx + tw + 2), min(h - 1, ty + base + 2)),
+        color,
+        -1,
+    )
+    cv2.putText(frame, text, (tx, ty), font, scale, CV_COLOR_TEXT, thickness, cv2.LINE_AA)
 
 # =============================================================================
 # Face-Specific Helper Functions
@@ -877,12 +940,19 @@ class FaceRecognitionProcessor:
             event_info = self._pending_http_events.pop(key)
             rect = obj.rect_params
             bbox = (int(rect.left), int(rect.top), int(rect.width), int(rect.height))
+            obj_meta_snapshot = {
+                "left": float(rect.left),
+                "top": float(rect.top),
+                "width": float(rect.width),
+                "height": float(rect.height),
+            }
 
             try:
                 self._frame_event_queue.put_nowait({
                     "event_info": event_info,
                     "bbox": bbox,
                     "source_id": sid,
+                    "obj_meta": obj_meta_snapshot,
                 })
             except Full:
                 print(f"[SgieProbe] Frame event queue full, dropping event for {key}")
@@ -918,7 +988,7 @@ class FaceRecognitionProcessor:
             y2 = min(h_img, int(t + h + h * padding))
             face_crop = full_frame[y1:y2, x1:x2] if (x2 > x1 and y2 > y1) else full_frame
 
-            self._save_and_send_http(item["event_info"], full_frame, face_crop)                 
+            self._save_and_send_http(item["event_info"], full_frame, face_crop, item.get("obj_meta"))                 
     
     # =========================================================================
     # Face Processing Pipeline
@@ -1284,36 +1354,35 @@ class FaceRecognitionProcessor:
     # HTTP Event: Save Images + Send
     # =========================================================================
 
-    def _save_and_send_http(self, event_info: dict, full_frame: np.ndarray, face_crop: np.ndarray):
-        """Save crop + full frame images to disk, then queue HTTP event send."""
+    def _save_and_send_http(self, event_info: dict, full_frame: np.ndarray, face_crop: np.ndarray, obj_meta):
+        """Save crop + annotated full frame images to disk, then queue HTTP event send."""
         person_id = event_info["person_id"]
+        name = event_info.get("name")
         camera_id = event_info.get("camera_id", "0")
         prefix = f"{camera_id}_{person_id}"
 
-        # Save crop face
+        annotated_full = full_frame.copy()
+        if obj_meta is not None:
+            draw_event_bbox(annotated_full, obj_meta, name, person_id)
+
         crop_path = save_image(face_crop, CROP_FACE_DIR, prefix)
         if crop_path:
             print(f"[HttpEvent] Crop saved: {crop_path}")
 
-        # Save full frame
-        full_path = save_image(full_frame, FULL_FRAME_DIR, prefix)
+        full_path = save_image(annotated_full, FULL_FRAME_DIR, prefix)
         if full_path:
             print(f"[HttpEvent] Full saved: {full_path}")
 
-        # Use camera_id as stream_id (API expects integer)
-        # camera_id "0" -> stream_id "0", camera_id "cam3" -> try parse or fallback
         try:
             stream_id = str(int(camera_id))
         except ValueError:
-            # Extract digits from camera_id, e.g. "cam3" -> "3"
             digits = "".join(c for c in camera_id if c.isdigit())
             stream_id = digits if digits else "0"
             print(f"[HttpEvent] camera_id={camera_id} -> stream_id={stream_id}")
 
-        # Send via HttpEventSender (non-blocking queue)
         self._http_sender.send(
             person_id=person_id,
-            full_frame=full_frame,
+            full_frame=annotated_full,
             face_crop=face_crop,
             stream_id=stream_id,
         )
@@ -1392,3 +1461,4 @@ class FaceRecognitionProcessor:
     @property
     def database(self) -> Optional[FaceDatabase]:
         return self._db
+
